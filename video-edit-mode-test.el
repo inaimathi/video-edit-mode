@@ -169,6 +169,100 @@
       (when (buffer-live-p other) (kill-buffer other))
       (delete-file source))))
 
+(ert-deftest video-edit-unit-switch-cancel-keeps-existing-session ()
+  "Cancelling a video switch preserves the source, edits, and editor buffer."
+  (let ((a (make-temp-file "video-edit-a-" nil ".mp4"))
+        (b (make-temp-file "video-edit-b-" nil ".mp4"))
+        (editor nil))
+    (unwind-protect
+        (save-window-excursion
+          (cl-letf (((symbol-function 'video-edit--probe)
+                     (lambda (_path) (video-edit-test--info)))
+                    ((symbol-function 'video-edit--start-mpv) #'ignore))
+            (setq editor (video-edit--new a))
+            (with-current-buffer editor
+              (setq video-edit--edits
+                    '((:start 10 :end 20 :kind "delete")))
+              (set-buffer-modified-p t))
+            (cl-letf (((symbol-function 'read-char-choice)
+                       (lambda (&rest _args) ?c)))
+              (should-error (video-edit-open b) :type 'user-error))
+            (should (eq editor (window-buffer (selected-window))))
+            (with-current-buffer editor
+              (should (equal video-edit--source a))
+              (should (equal (plist-get (car video-edit--edits) :start) 10))
+              (should (buffer-modified-p)))))
+      (when (buffer-live-p editor)
+        (with-current-buffer editor (set-buffer-modified-p nil))
+        (kill-buffer editor))
+      (delete-file a)
+      (delete-file b))))
+
+(ert-deftest video-edit-unit-switch-save-and-reuse-buffer ()
+  "Switching files saves old edits and reuses the same Emacs window/buffer."
+  (let ((a (make-temp-file "video-edit-a-" nil ".mp4"))
+        (b (make-temp-file "video-edit-b-" nil ".mp4"))
+        (project (make-temp-file "video-edit-a-" nil ".ved.json"))
+        (editor nil))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (cl-letf (((symbol-function 'video-edit--probe)
+                     (lambda (_path) (video-edit-test--info)))
+                    ((symbol-function 'video-edit--start-mpv) #'ignore))
+            (setq editor (video-edit--new a))
+            (with-current-buffer editor
+              (setq video-edit--edits
+                    '((:start 10 :end 20 :kind "delete"))
+                    video-edit--project-file project)
+              (set-buffer-modified-p t))
+            (cl-letf (((symbol-function 'read-char-choice)
+                       (lambda (&rest _args) ?y)))
+              (should (eq editor (video-edit-open b))))
+            (should (= (count-windows) 1))
+            (should (eq editor (window-buffer (selected-window))))
+            (with-current-buffer editor
+              (should (equal video-edit--source b))
+              (should-not video-edit--edits)
+              (should-not video-edit--project-file)
+              (should-not (buffer-modified-p)))
+            (with-temp-buffer
+              (insert-file-contents project)
+              (let* ((json (json-parse-buffer :object-type 'hash-table
+                                              :array-type 'list))
+                     (edits (gethash "edits" json)))
+                (should (equal (gethash "source" json) a))
+                (should (= (length edits) 1))
+                (should (= (gethash "start" (car edits)) 10))))))
+      (when (buffer-live-p editor) (kill-buffer editor))
+      (delete-file a)
+      (delete-file b)
+      (delete-file project))))
+
+(ert-deftest video-edit-unit-single-buffer-preview-layout ()
+  "Opening a video doesn't split a window or create an mpv placeholder buffer."
+  (let ((source (make-temp-file "video-edit-inline-" nil ".mkv"))
+        (other (generate-new-buffer " *video-edit-elsewhere*"))
+        (editor nil))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          (cl-letf (((symbol-function 'video-edit--probe)
+                     (lambda (_path) (video-edit-test--info)))
+                    ((symbol-function 'video-edit--start-mpv) #'ignore))
+            (setq editor (video-edit--new source))
+            (should (= 1 (count-windows)))
+            (should-not (with-current-buffer editor
+                          (get-buffer " *video-edit-mpv-pane*")))
+            (switch-to-buffer other)
+            (should (= 1 (count-windows)))
+            (switch-to-buffer editor)
+            (should (eq editor (window-buffer (selected-window))))
+            (should (= 1 (count-windows)))))
+      (when (buffer-live-p editor) (kill-buffer editor))
+      (when (buffer-live-p other) (kill-buffer other))
+      (delete-file source))))
+
 (ert-deftest video-edit-unit-save-project-keeps-buffer-local-data ()
   "Saving a project serializes the editor buffer, not `with-temp-file'."
   (let* ((source (make-temp-file "video-edit-save-source-" nil ".mp4"))
@@ -448,7 +542,10 @@
     (should (member "--input-ipc-server=/tmp/mpv.sock" embedded))
     (should (equal (car (last embedded)) "/tmp/input.mp4"))
     (should-not (cl-some (lambda (arg) (string-prefix-p "--wid=" arg)) external))
-    (should-not (member "--input-vo-keyboard=yes" external))))
+    (should-not (member "--input-vo-keyboard=yes" external))
+    (should (member "--input-conf=/tmp/input.conf"
+                    (video-edit--mpv-args "/tmp/input.mp4" "/tmp/mpv.sock"
+                                          "9876" "/tmp/input.conf")))))
 
 (ert-deftest video-edit-unit-probe-fps-binding ()
   "Keep ffprobe metadata validation inside the FPS lexical scope."

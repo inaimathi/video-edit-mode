@@ -1,6 +1,6 @@
 ;;; video-edit-mode.el --- Keyboard-driven video cuts and replacements -*- lexical-binding: t; -*-
 
-;; Version: 0.7.0
+;; Version: 0.9.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: multimedia, convenience
 
@@ -29,6 +29,9 @@
 (defcustom video-edit-preset "medium" "H.264 encoding preset." :type 'string)
 (defcustom video-edit-preview-height 480 "Maximum height of preview exports." :type 'integer)
 (defcustom video-edit-poll-interval 0.4 "Seconds between MPV position queries." :type 'number)
+(defcustom video-edit-inline-preview-fraction 0.45
+  "Fraction of the editor window reserved for embedded mpv playback on X11."
+  :type 'number)
 (defcustom video-edit-embed-mpv t
   "If non-nil, embed mpv in an Emacs child frame on X11.
 On text terminals or non-X11 graphical systems, use a separate mpv window."
@@ -70,12 +73,14 @@ Set this to nil to restore ordinary `find-file' behavior for videos and projects
 (defvar-local video-edit--render-process nil)
 (defvar-local video-edit--render-log nil)
 (defvar-local video-edit--render-status nil)
-(defvar-local video-edit--preview-buffer nil)
+(defvar-local video-edit--preview-lines 0)
 (defvar-local video-edit--preview-host nil)
 (defvar-local video-edit--preview-parent nil)
 (defvar-local video-edit--preview-geometry nil)
+(defvar video-edit--session-buffer nil
+  "The single live video editor session, reused for successive sources.")
 (defvar video-edit--preview-sessions nil
-  "Editor buffers with active embedded mpv preview panes.")
+  "Editor buffers whose X11 child frames host mpv.")
 (defvar video-edit--syncing-preview nil)
 (defvar video-edit--request-number 0)
 
@@ -235,6 +240,10 @@ is negative).  At either boundary, stay on the boundary edit."
          (selected (get-text-property (point) 'video-edit-index))
          (modified (buffer-modified-p)))
     (erase-buffer)
+    ;; The video occupies blank lines in THIS buffer, not a separate pane.
+    (setq video-edit--preview-lines
+          (video-edit--preview-rows (get-buffer-window (current-buffer) t)))
+    (dotimes (_ video-edit--preview-lines) (insert "\n"))
     (insert (propertize "VIDEO EDIT  " 'face 'bold)
             (abbreviate-file-name video-edit--source) "\n"
             (format "Source: %s  %sx%s  %.4f fps  %s\n"
@@ -271,7 +280,7 @@ is negative).  At either boundary, stay on the boundary edit."
             "i/o set marks  k clear marks\n"
             "d delete  r video/keep audio  R video+audio  C-k remove edit\n"
             "C-n/C-p select next/previous edit  RET seek to edit  u undo\n"
-            "j jump to time  e export  p preview  v show player  C-x C-s save  q close\n")
+            "j jump  e export  p preview  C-c C-k cancel render  v player  C-x C-s save  q close\n")
     (if (and (integerp selected) video-edit--edits)
         (goto-char (or (video-edit--edit-row-position
                         (min selected (1- (length video-edit--edits))))
@@ -372,43 +381,58 @@ is negative).  At either boundary, stay on the boundary edit."
              (video-edit--refresh))))))))
 
 ;; ------------------------------ X11 preview -------------------------------
-;; A normal Emacs window has no X11 ID, but an Emacs child *frame* does.  Put a
-;; borderless child frame over the body of a split-window preview buffer; mpv's
-;; --wid then creates its video X window as a child of that Emacs frame.
-;; Neither a native module nor a toolkit is needed.  X11 keyboard focus is
-;; pointer-sensitive: move the pointer over the video for mpv's own shortcuts.
+;; There is just one editor buffer.  Its leading blank lines reserve space for
+;; an X11 child *frame* hosting mpv.  The frame overlays the upper portion of
+;; the editor's Emacs window; no separate mpv/placeholder buffer or split
+;; window exists.  When the editor is hidden, its child frame is hidden too.
 
-(defun video-edit--preview-window ()
-  "Return the Emacs preview window, if still displayed in its parent frame."
-  (when (and (buffer-live-p video-edit--preview-buffer)
-             (frame-live-p video-edit--preview-parent))
-    (get-buffer-window video-edit--preview-buffer video-edit--preview-parent)))
+(defun video-edit--editor-window ()
+  "Return the editor window in its embedding parent frame, if visible."
+  (when (frame-live-p video-edit--preview-parent)
+    (get-buffer-window (current-buffer) video-edit--preview-parent)))
+
+(defun video-edit--preview-rows (&optional window)
+  "Number of text rows to reserve for video inside WINDOW."
+  (if (and video-edit-embed-mpv (window-live-p window)
+           (eq (framep (window-frame window)) 'x))
+      (let ((height (window-body-height window)))
+        (max 0 (min (max 0 (- height 5))
+                    (max 3 (floor (* height video-edit-inline-preview-fraction))))))
+    0))
 
 (defun video-edit--preview-sync ()
-  "Fit the native mpv host over the preview window, or hide it if absent."
+  "Position embedded mpv over reserved rows in this editor; hide otherwise."
   (when (and (frame-live-p video-edit--preview-host)
              (not video-edit--syncing-preview))
-    (let ((video-edit--syncing-preview t)
-          (window (video-edit--preview-window)))
+    (let* ((video-edit--syncing-preview t)
+           (window (video-edit--editor-window)))
       (if (not (and (window-live-p window)
-                    (get-buffer-window (current-buffer) video-edit--preview-parent)))
+                    (= (window-start window) (point-min))))
           (when (frame-visible-p video-edit--preview-host)
             (make-frame-invisible video-edit--preview-host t))
+        (let ((rows (video-edit--preview-rows window)))
+          (unless (= rows video-edit--preview-lines)
+            (video-edit--refresh)))
         (let* ((edges (window-body-pixel-edges window))
                (x (nth 0 edges)) (y (nth 1 edges))
                (w (max 1 (- (nth 2 edges) x)))
-               (h (max 1 (- (nth 3 edges) y)))
+               (h (min (max 1 (- (nth 3 edges) y))
+                       (max 1 (* video-edit--preview-lines
+                                 (frame-char-height video-edit--preview-parent)))))
                (geometry (list x y w h)))
-          (unless (equal geometry video-edit--preview-geometry)
-            (setq video-edit--preview-geometry geometry)
-            (let ((frame-resize-pixelwise t))
-              (set-frame-size video-edit--preview-host w h t)
-              (set-frame-position video-edit--preview-host x y)))
-          (unless (frame-visible-p video-edit--preview-host)
-            (make-frame-visible video-edit--preview-host)))))))
+          (if (zerop video-edit--preview-lines)
+              (when (frame-visible-p video-edit--preview-host)
+                (make-frame-invisible video-edit--preview-host t))
+            (unless (equal geometry video-edit--preview-geometry)
+              (setq video-edit--preview-geometry geometry)
+              (let ((frame-resize-pixelwise t))
+                (set-frame-size video-edit--preview-host w h t)
+                (set-frame-position video-edit--preview-host x y)))
+            (unless (frame-visible-p video-edit--preview-host)
+              (make-frame-visible video-edit--preview-host))))))))
 
 (defun video-edit--preview-layout-change (&optional _frame)
-  "Update embedded previews after Emacs window or frame layout changes."
+  "Update embedded previews after Emacs window layout or buffer changes."
   (dolist (buffer (copy-sequence video-edit--preview-sessions))
     (if (not (buffer-live-p buffer))
         (setq video-edit--preview-sessions (delq buffer video-edit--preview-sessions))
@@ -416,56 +440,41 @@ is negative).  At either boundary, stay on the boundary edit."
         (video-edit--preview-sync)))))
 
 (defun video-edit--preview-install-hooks ()
-  "Enable geometry synchronization while at least one editor is open."
+  "Synchronize embedded video while an editor is active."
   (unless video-edit--preview-sessions
     (add-hook 'window-size-change-functions #'video-edit--preview-layout-change)
-    (add-hook 'window-configuration-change-hook #'video-edit--preview-layout-change))
+    (add-hook 'window-configuration-change-hook #'video-edit--preview-layout-change)
+    (add-hook 'window-state-change-functions #'video-edit--preview-layout-change))
   (cl-pushnew (current-buffer) video-edit--preview-sessions))
 
 (defun video-edit--preview-destroy ()
-  "Discard the embedded host frame and its placeholder buffer."
+  "Discard the native mpv host (the editor buffer is retained)."
   (setq video-edit--preview-sessions
         (delq (current-buffer) video-edit--preview-sessions))
   (unless video-edit--preview-sessions
     (remove-hook 'window-size-change-functions #'video-edit--preview-layout-change)
-    (remove-hook 'window-configuration-change-hook #'video-edit--preview-layout-change))
-  (let ((preview-window (video-edit--preview-window)))
-    (when (frame-live-p video-edit--preview-host)
-      (delete-frame video-edit--preview-host t))
-    (when (and (window-live-p preview-window) (window-parent preview-window))
-      (delete-window preview-window)))
-  (when (buffer-live-p video-edit--preview-buffer)
-    (kill-buffer video-edit--preview-buffer))
+    (remove-hook 'window-configuration-change-hook #'video-edit--preview-layout-change)
+    (remove-hook 'window-state-change-functions #'video-edit--preview-layout-change))
+  (when (frame-live-p video-edit--preview-host)
+    (delete-frame video-edit--preview-host t))
   (setq video-edit--preview-host nil
-        video-edit--preview-buffer nil
         video-edit--preview-parent nil
         video-edit--preview-geometry nil))
 
 (defun video-edit--preview-create ()
-  "Create an X11 child-frame host over a new preview pane.
-Return the host frame's XID as a string, or nil if embedding is unavailable."
-  (when (and video-edit-embed-mpv
-             (window-live-p (get-buffer-window (current-buffer) t))
-             (eq (framep (window-frame (get-buffer-window (current-buffer) t))) 'x))
-    (let* ((editor (get-buffer-window (current-buffer) t))
-           (parent (window-frame editor))
-           (preview (generate-new-buffer " *video-edit-mpv-pane*"))
-           (window nil))
-      (setq video-edit--preview-buffer preview
-            video-edit--preview-parent parent)
-      (condition-case err
-          (progn
-            (setq window (split-window editor nil 'above))
-            (set-window-buffer window preview)
-            (set-window-dedicated-p window t)
-            (set-window-parameter window 'no-other-window t)
-            (with-current-buffer preview
-              (setq-local mode-line-format nil)
-              (setq-local cursor-type nil)
-              (insert "mpv player (move pointer here for mpv keys)\n"))
-            (let* ((edges (window-body-pixel-edges window))
-                   (width (max 1 (- (nth 2 edges) (nth 0 edges))))
-                   (height (max 1 (- (nth 3 edges) (nth 1 edges)))))
+  "Overlay an X11 child frame on this editor buffer's reserved video space.
+Return its XID, or nil when embedding is not available."
+  (let ((editor (get-buffer-window (current-buffer) t)))
+    (when (and video-edit-embed-mpv (window-live-p editor)
+               (eq (framep (window-frame editor)) 'x))
+      (let* ((parent (window-frame editor))
+             (edges (window-body-pixel-edges editor))
+             (width (max 1 (- (nth 2 edges) (nth 0 edges))))
+             (height (max 1 (* (video-edit--preview-rows editor)
+                               (frame-char-height parent)))))
+        (setq video-edit--preview-parent parent)
+        (condition-case err
+            (progn
               (let ((frame-resize-pixelwise t))
                 (setq video-edit--preview-host
                       (make-frame
@@ -481,27 +490,28 @@ Return the host frame's XID as a string, or nil if embedding is unavailable."
                          (left-fringe . 0) (right-fringe . 0)
                          (vertical-scroll-bars . nil)
                          (menu-bar-lines . 0) (tool-bar-lines . 0)
-                         (tab-bar-lines . 0) (unsplittable . t))))))
-            (let ((id (frame-parameter video-edit--preview-host 'window-id)))
-              (unless (and id (string-match-p
-                               "\\`\\(?:[0-9]+\\|0[xX][[:xdigit:]]+\\)\\'"
-                               (format "%s" id)))
-                (error "Child frame has no usable X11 window-id: %S" id))
-              (video-edit--preview-install-hooks)
-              (video-edit--preview-sync)
-              (format "%s" id)))
-        (error
-         (video-edit--preview-destroy)
-         (message "video-edit: embedding unavailable (%s); using normal mpv window"
-                  (error-message-string err))
-         nil)))))
+                         (tab-bar-lines . 0) (unsplittable . t)))))
+              (let ((id (frame-parameter video-edit--preview-host 'window-id)))
+                (unless (and id (string-match-p
+                                 "\\`\\(?:[0-9]+\\|0[xX][[:xdigit:]]+\\)\\'"
+                                 (format "%s" id)))
+                  (error "Child frame has no usable X11 window-id: %S" id))
+                (video-edit--preview-install-hooks)
+                (video-edit--preview-sync)
+                (format "%s" id)))
+          (error
+           (video-edit--preview-destroy)
+           (message "video-edit: embedding unavailable (%s); using normal mpv window"
+                    (error-message-string err))
+           nil))))))
 
-(defun video-edit--mpv-args (source socket &optional xid)
-  "Construct mpv arguments for SOURCE with IPC SOCKET and optional X11 XID."
+(defun video-edit--mpv-args (source socket &optional xid input-conf)
+  "Construct mpv arguments for SOURCE, IPC SOCKET, XID and INPUT-CONF."
   (append (list "--no-config" "--force-window=yes"
                 "--keep-open=yes" "--pause=yes" "--terminal=no")
           (when xid (list (concat "--wid=" xid) "--input-vo-keyboard=yes"
                           "--input-default-bindings=yes"))
+          (when input-conf (list (concat "--input-conf=" input-conf)))
           (list (concat "--input-ipc-server=" socket) source)))
 
 (defun video-edit--start-mpv ()
@@ -509,9 +519,14 @@ Return the host frame's XID as a string, or nil if embedding is unavailable."
   (let ((exe (video-edit--executable video-edit-mpv))
         (buffer (current-buffer)))
     (setq video-edit--socket-dir (make-temp-file "video-edit-mpv-" t))
-    (let ((xid (if (frame-live-p video-edit--preview-host)
-                   (format "%s" (frame-parameter video-edit--preview-host 'window-id))
-                 (video-edit--preview-create))))
+    (let* ((xid (if (frame-live-p video-edit--preview-host)
+                    (format "%s" (frame-parameter video-edit--preview-host 'window-id))
+                  (video-edit--preview-create)))
+           (input-conf (when xid (expand-file-name "input.conf" video-edit--socket-dir))))
+      ;; A video cannot be quit separately from its owning editor via mpv's
+      ;; normal q/Q keys.  Use `video-edit-quit' to close the entire session.
+      (when input-conf
+        (with-temp-file input-conf (insert "q ignore\nQ ignore\n")))
       (setq video-edit--mpv
             (make-process
              :name "video-edit-mpv" :buffer (get-buffer-create " *video-edit-mpv-log*")
@@ -520,7 +535,7 @@ Return the host frame's XID as a string, or nil if embedding is unavailable."
                             (video-edit--mpv-args
                              video-edit--source
                              (expand-file-name "mpv.sock" video-edit--socket-dir)
-                             xid)))))
+                             xid input-conf)))))
     (setq video-edit--connect-timer
           (run-at-time 0.15 0.15 #'video-edit--connect buffer))
     (setq video-edit--poll-timer
@@ -528,6 +543,8 @@ Return the host frame's XID as a string, or nil if embedding is unavailable."
                        #'video-edit--poll buffer))))
 
 (defun video-edit--cleanup ()
+  (when (eq video-edit--session-buffer (current-buffer))
+    (setq video-edit--session-buffer nil))
   (dolist (timer (list video-edit--connect-timer video-edit--poll-timer))
     (when (timerp timer) (cancel-timer timer)))
   (dolist (proc (list video-edit--ipc video-edit--mpv))
@@ -539,53 +556,111 @@ Return the host frame's XID as a string, or nil if embedding is unavailable."
   ;; The FFmpeg and preview sentinels own their temporary files.
   nil)
 
+(defun video-edit--session ()
+  "Return the single active editor buffer, including pre-upgrade sessions."
+  (unless (and (buffer-live-p video-edit--session-buffer)
+               (with-current-buffer video-edit--session-buffer
+                 (eq major-mode 'video-edit-mode)))
+    (setq video-edit--session-buffer
+          (cl-find-if (lambda (buffer)
+                        (with-current-buffer buffer
+                          (eq major-mode 'video-edit-mode)))
+                      (buffer-list))))
+  video-edit--session-buffer)
+
+(defun video-edit--save-before-switch (buffer)
+  "Ask whether to save BUFFER's changes before replacing its video.
+Cancel leaves the entire editor and mpv process untouched."
+  (with-current-buffer buffer
+    (when (buffer-modified-p)
+      (pcase (read-char-choice
+              (format "Save edits for %s? (y)es, (n)o, (c)ancel: "
+                      (file-name-nondirectory video-edit--source))
+              '(?y ?n ?c))
+        (?y (video-edit-save-project))
+        (?n nil)
+        (?c (user-error "Video switch cancelled"))))))
+
+(defun video-edit--display-editor (buffer)
+  "Show BUFFER in the selected window, without duplicate editor panes."
+  (let ((target (selected-window)))
+    ;; An editor has a single on-screen home.  If it was displayed in another
+    ;; pane, release that pane before displaying it here.
+    (dolist (window (get-buffer-window-list buffer nil t))
+      (unless (eq window target)
+        (when (window-live-p window)
+          (switch-to-prev-buffer window 'bury))))
+    (set-window-buffer target buffer)
+    (with-current-buffer buffer (video-edit--preview-sync))
+    buffer))
+
 (defun video-edit--new (source &optional edits project-file)
+  "Open SOURCE with EDITS in the existing editor session, if any.
+Prompt to save modified edits before replacing the current source."
   (let* ((source (expand-file-name source))
          (info (video-edit--probe source))
-         (buffer (generate-new-buffer
-                  (format "*video-edit: %s*" (file-name-nondirectory source)))))
-    (with-current-buffer buffer
-      (video-edit-mode)
+         (editor (video-edit--session)))
+    ;; Validate before disposing of the old session, so a malformed project
+    ;; or missing replacement file never destroys the existing edits/player.
+    (video-edit--segments source info edits)
+    (when (and (buffer-live-p editor)
+               (with-current-buffer editor
+                 (process-live-p video-edit--render-process)))
+      (user-error "Cannot switch videos while exporting; finish export first"))
+    (when (buffer-live-p editor)
+      (video-edit--save-before-switch editor))
+    (unless (buffer-live-p editor)
+      (setq editor (generate-new-buffer
+                    (format "*video-edit: %s*" (file-name-nondirectory source))))
+      (with-current-buffer editor (video-edit-mode)))
+    (with-current-buffer editor
+      (when video-edit--source (video-edit--cleanup))
       (setq video-edit--source source
             video-edit--info info
             video-edit--fps (video-edit--rational-value (gethash "fps" info))
             video-edit--frames (gethash "frame_count" info)
+            video-edit--in nil
+            video-edit--out nil
+            video-edit--position 0
+            video-edit--speed 1.0
+            video-edit--display-frame nil
             video-edit--edits edits
-            video-edit--project-file project-file)
-      ;; Validate saved edits immediately rather than waiting until export.
-      (condition-case err
-          (progn (video-edit--segments video-edit--source video-edit--info edits)
-                 (video-edit--refresh))
-        (error (kill-buffer buffer) (signal (car err) (cdr err)))))
-    ;; A native preview requires a displayed Emacs window before the child
-    ;; frame can be positioned.  Launch mpv only after displaying the editor.
-    ;; Respect the window from which `find-file' (or `video-edit-open') was
-    ;; invoked.  `pop-to-buffer' may choose an unrelated side window.
-    (switch-to-buffer buffer)
+            video-edit--history nil
+            video-edit--project-file project-file
+            video-edit--mpv nil
+            video-edit--ipc nil
+            video-edit--socket-dir nil
+            video-edit--connect-timer nil
+            video-edit--poll-timer nil)
+      (rename-buffer (format "*video-edit: %s*" (file-name-nondirectory source)) t)
+      (video-edit--refresh)
+      (set-buffer-modified-p nil))
+    (setq video-edit--session-buffer editor)
+    (video-edit--display-editor editor)
+    (set-window-start (selected-window) (with-current-buffer editor (point-min)))
     (condition-case err
-        (with-current-buffer buffer (video-edit--start-mpv))
-      (error (kill-buffer buffer) (signal (car err) (cdr err))))
-    buffer))
+        (with-current-buffer editor (video-edit--start-mpv))
+      (error (message "video-edit: could not launch mpv: %s"
+                      (error-message-string err))))
+    editor))
 
 (defun video-edit--existing-editor (source)
-  "Find the currently open editor for SOURCE, even if reached via a symlink."
-  (let ((canonical (file-truename (expand-file-name source))))
-    (cl-find-if
-     (lambda (buffer)
-       (with-current-buffer buffer
-         (and (eq major-mode 'video-edit-mode)
-              video-edit--source
-              (equal canonical (file-truename video-edit--source)))))
-     (buffer-list))))
+  "Return the active editor if its SOURCE matches, including symlinks."
+  (let ((editor (video-edit--session))
+        (canonical (file-truename (expand-file-name source))))
+    (when (and (buffer-live-p editor)
+               (with-current-buffer editor
+                 (and video-edit--source
+                      (equal canonical (file-truename video-edit--source)))))
+      editor)))
 
 ;;;###autoload
 (defun video-edit-open (source)
-  "Open SOURCE in a non-destructive video editor buffer.
-Reuse an existing editor for the same source file."
+  "Open SOURCE in the one video editor session, prompting on replacement."
   (interactive "fVideo file: ")
   (let ((buffer (video-edit--existing-editor source)))
     (if buffer
-        (progn (switch-to-buffer buffer) buffer)
+        (video-edit--display-editor buffer)
       (video-edit--new source))))
 
 (defun video-edit--find-file-advice (original filename &optional wildcards)
@@ -635,7 +710,7 @@ An already-open project is selected instead of losing unsaved edits."
          (existing (and (file-regular-p project)
                         (video-edit--existing-project project))))
     (if existing
-        (progn (switch-to-buffer existing) existing)
+        (video-edit--display-editor existing)
       (unless (file-regular-p project)
         (user-error "Video-edit project does not exist: %s" project))
       (let* ((data (condition-case err
@@ -1063,6 +1138,81 @@ LABEL identifies an export or preview.  Handle stdout split at any byte."
       (display-buffer video-edit--render-log)
     (user-error "No FFmpeg render log yet")))
 
+(defun video-edit--render-finished (process editor output rendered-output filter-file preview label)
+  "Finish PROCESS once, cleaning up its temporary files.
+EDITOR is the owning buffer, OUTPUT the destination, RENDERED-OUTPUT the
+staged MP4, FILTER-FILE the graph script, and PREVIEW and LABEL describe the
+render.  A cancelled render never replaces an existing destination file."
+  (unless (process-get process 'video-edit-finished)
+    (process-put process 'video-edit-finished t)
+    (let* ((cancelled (process-get process 'video-edit-cancelled))
+           (success (and (not cancelled)
+                         (eq (process-status process) 'exit)
+                         (zerop (process-exit-status process))))
+           (publish-error nil))
+      (ignore-errors (delete-file filter-file))
+      ;; Exports render to a sibling temporary MP4 and only replace the
+      ;; destination after success.  Cancelling a re-export therefore does
+      ;; not destroy the last good export.
+      (when (and success (not preview))
+        (condition-case err
+            (rename-file rendered-output output t)
+          (file-error
+           (setq publish-error (error-message-string err)
+                 success nil))))
+      (unless success (ignore-errors (delete-file rendered-output)))
+      (when (buffer-live-p editor)
+        (with-current-buffer editor
+          (when (eq video-edit--render-process process)
+            (setq video-edit--render-process nil
+                  video-edit--render-status
+                  (cond (cancelled (format " %s cancelled" label))
+                        (success (format " %s done" label))
+                        (t (format " %s FAILED" label))))
+            (force-mode-line-update))
+          (when publish-error
+            (when (buffer-live-p video-edit--render-log)
+              (with-current-buffer video-edit--render-log
+                (goto-char (point-max))
+                (insert (format "\nFailed to publish export: %s\n" publish-error)))))))
+      (cond
+       (cancelled
+        (message "video-edit %s cancelled" label))
+       (success
+        (message "%s complete: %s" label output)
+        (when preview
+          (make-process
+           :name "video-edit-preview" :noquery t
+           :command (list (video-edit--executable video-edit-mpv)
+                          "--no-config" output)
+           :sentinel (lambda (player _event)
+                       (when (memq (process-status player) '(exit signal))
+                         (ignore-errors (delete-file output)))))))
+       (t
+        (message "%s failed%s; press l for FFmpeg diagnostics"
+                 label (if publish-error (concat ": " publish-error) "")))))))
+
+(defun video-edit-cancel-render ()
+  "Cancel the current export or preview without changing any edits.
+Bind this to `C-c C-k' in `video-edit-mode'.  The partially written MP4
+is discarded; a previously completed export at the destination is kept."
+  (interactive)
+  (let ((process video-edit--render-process))
+    (unless (process-live-p process)
+      (user-error "No video export or preview is running"))
+    (process-put process 'video-edit-cancelled t)
+    (setq video-edit--render-status " Cancelling render")
+    (force-mode-line-update)
+    (message "Cancelling video-edit render...")
+    ;; `delete-process' immediately kills the subprocess, rather than
+    ;; waiting for FFmpeg to finish writing a potentially huge output.
+    (delete-process process)
+    ;; The sentinel normally runs on deletion; finalize explicitly as a
+    ;; fallback so that the editor never stays stuck in 'rendering' state.
+    (unless (process-get process 'video-edit-finished)
+      (let ((finish (process-get process 'video-edit-finish)))
+        (when finish (funcall finish process))))))
+
 (defun video-edit--run-render (output height preview)
   "Render the current timeline asynchronously to OUTPUT.
 HEIGHT is the maximum resolution height, or nil for original resolution.
@@ -1075,6 +1225,14 @@ Progress is shown in the echo area and mode line; errors go to the log."
                                          (if preview 27 video-edit-crf)
                                          (if preview "ultrafast" video-edit-preset)))
          (filter-file (make-temp-file "video-edit-filter-" nil ".txt"))
+         ;; Stage exports beside the destination so a cancelled re-export
+         ;; leaves any previously completed MP4 untouched.
+         (rendered-output
+          (if preview output
+            (make-temp-file
+             (expand-file-name
+              (concat "." (file-name-nondirectory output) ".video-edit-")
+              (file-name-directory output)) nil ".mp4")))
          (editor (current-buffer))
          (duration (plist-get plan :duration))
          (label (if preview "Preview" "Export"))
@@ -1087,43 +1245,26 @@ Progress is shown in the echo area and mode line; errors go to the log."
               (erase-buffer)
               (insert (format "Rendering %s\n\nFFmpeg diagnostics:\n" output))))
           (setq video-edit--render-log log)
-          (setq video-edit--render-process
-                (make-process
-                 :name "video-edit-render" :buffer nil :stderr log :noquery t
-                 :connection-type 'pipe :coding 'utf-8-unix
-                 :command (video-edit--render-command plan filter-file output)
-                 :filter (lambda (proc text)
-                           (video-edit--render-progress-filter
-                            proc text editor duration label))
-                 :sentinel
-                 (lambda (proc _event)
-                   (when (memq (process-status proc) '(exit signal))
-                     (ignore-errors (delete-file filter-file))
-                     (let ((success (and (eq (process-status proc) 'exit)
-                                         (zerop (process-exit-status proc)))))
-                       (when (buffer-live-p editor)
-                         (with-current-buffer editor
-                           (setq video-edit--render-process nil
-                                 video-edit--render-status
-                                 (if success (format " %s done" label)
-                                   (format " %s FAILED" label)))
-                           (force-mode-line-update)))
-                       (if success
-                           (progn
-                             (message "%s complete: %s" label output)
-                             (when preview
-                               (make-process
-                                :name "video-edit-preview" :noquery t
-                                :command (list (video-edit--executable video-edit-mpv)
-                                               "--no-config" output)
-                                :sentinel (lambda (player _event)
-                                            (when (memq (process-status player) '(exit signal))
-                                              (ignore-errors (delete-file output)))))))
-                         (when preview (ignore-errors (delete-file output)))
-                         (message "%s failed; press l for FFmpeg diagnostics" label)))))))
+          (let ((finish (lambda (proc)
+                          (video-edit--render-finished
+                           proc editor output rendered-output filter-file preview label))))
+            (setq video-edit--render-process
+                  (make-process
+                   :name "video-edit-render" :buffer nil :stderr log :noquery t
+                   :connection-type 'pipe :coding 'utf-8-unix
+                   :command (video-edit--render-command plan filter-file rendered-output)
+                   :filter (lambda (proc text)
+                             (unless (process-get proc 'video-edit-cancelled)
+                               (video-edit--render-progress-filter
+                                proc text editor duration label)))
+                   :sentinel (lambda (proc _event)
+                               (when (memq (process-status proc) '(exit signal))
+                                 (funcall finish proc)))))
+            (process-put video-edit--render-process 'video-edit-finish finish))
           (video-edit--render-progress-update editor duration 0 nil label))
       (error
        (ignore-errors (delete-file filter-file))
+       (unless preview (ignore-errors (delete-file rendered-output)))
        (setq video-edit--render-process nil
              video-edit--render-status nil)
        (force-mode-line-update)
@@ -1150,32 +1291,32 @@ Progress is shown in the echo area and mode line; errors go to the log."
     (video-edit--run-render output video-edit-preview-height t)))
 
 (defun video-edit-show-player ()
-  "Restore the player pane and restart mpv if it was quit.
-For external playback, restart mpv if needed."
+  "Restore embedded playback for this editor; restart mpv if necessary.
+If the editor moved to another top-level Emacs frame, embed there."
   (interactive)
-  (when (buffer-live-p video-edit--preview-buffer)
-    (unless (video-edit--preview-window)
-      (let ((editor (get-buffer-window (current-buffer) video-edit--preview-parent)))
-        (unless editor
-          (user-error "Display the editor in its original frame first"))
-        (let ((window (split-window editor nil 'above)))
-          (set-window-buffer window video-edit--preview-buffer)
-          (set-window-dedicated-p window t)
-          (set-window-parameter window 'no-other-window t))))
-    (video-edit--preview-sync))
-  (unless (process-live-p video-edit--mpv)
-    (dolist (timer (list video-edit--connect-timer video-edit--poll-timer))
-      (when (timerp timer) (cancel-timer timer)))
-    (when (process-live-p video-edit--ipc) (delete-process video-edit--ipc))
-    (when video-edit--socket-dir
-      (ignore-errors (delete-directory video-edit--socket-dir t)))
-    (setq video-edit--ipc nil
-          video-edit--connect-timer nil
-          video-edit--poll-timer nil)
-    (video-edit--start-mpv)))
+  (let ((window (get-buffer-window (current-buffer) t)))
+    (unless window (user-error "Display this editor buffer first"))
+    (when (and (frame-live-p video-edit--preview-parent)
+               (not (eq (window-frame window) video-edit--preview-parent)))
+      (video-edit--cleanup)
+      (setq video-edit--mpv nil video-edit--ipc nil
+            video-edit--connect-timer nil video-edit--poll-timer nil
+            video-edit--socket-dir nil))
+    (unless (process-live-p video-edit--mpv)
+      (dolist (timer (list video-edit--connect-timer video-edit--poll-timer))
+        (when (timerp timer) (cancel-timer timer)))
+      (when (process-live-p video-edit--ipc)
+        (delete-process video-edit--ipc))
+      (when video-edit--socket-dir
+        (ignore-errors (delete-directory video-edit--socket-dir t)))
+      (setq video-edit--ipc nil
+            video-edit--connect-timer nil
+            video-edit--poll-timer nil)
+      (video-edit--start-mpv))
+    (video-edit--preview-sync)))
 
 (defun video-edit-quit ()
-  "Close editor and the source MPV window."
+  "Close the editor buffer and its embedded MPV window together."
   (interactive)
   (when (and (buffer-modified-p)
              (not (yes-or-no-p "Discard unsaved video edits? ")))
@@ -1217,6 +1358,7 @@ For external playback, restart mpv if needed."
     (define-key map (kbd "u") #'video-edit-undo)
     (define-key map (kbd "RET") #'video-edit-jump-to-edit)
     (define-key map (kbd "e") #'video-edit-export)
+    (define-key map (kbd "C-c C-k") #'video-edit-cancel-render)
     (define-key map (kbd "l") #'video-edit-show-render-log)
     (define-key map (kbd "p") #'video-edit-preview)
     (define-key map (kbd "v") #'video-edit-show-player)

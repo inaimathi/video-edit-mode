@@ -1,4 +1,4 @@
-# video-edit-mode.el 0.7.0 — Emacs-only editor with X11 embedding
+# video-edit-mode.el 0.8.0 — Single-buffer editor with embedded mpv
 
 Minimal, local, keyboard-driven video editing. **No Python, shell scripts,
 Emacs packages, GTK, Qt, or desktop environment.** Only three external
@@ -32,14 +32,21 @@ Open a local video with ordinary `C-x C-f` / `find-file` (for example
 `find-file` **before Emacs loads the binary video into a text buffer**.
 The source stays untouched; `C-x C-s` saves a separate `.ved.json` project,
 recording the source path and all edits in source-frame coordinates.
-Opening the same video again reuses its existing editor buffer. You can also
+Opening the same video again reuses its existing editor buffer. Opening a
+*different* video reuses that same buffer and mpv host, prompting to save,
+discard, or cancel if the current video has unsaved edits. Cancel leaves the
+current editor intact. You can also
 `C-x C-f` a `.ved.json` project: it loads the source video, restores its edits,
 and continues saving to that project file. Relative source and replacement
 paths resolve relative to the project; missing source files produce an error.
 Reopening an already-open project preserves the live editor's unsaved changes.
-The editor replaces the buffer in the **selected** Emacs window, rather than opening a
-new side window; on X11, the player is split above the editor in that window.
-Other Emacs panes are left alone.
+The editor replaces the buffer in the **selected** Emacs window. On X11, mpv
+is displayed inside the *same* Emacs buffer as the timeline: blank lines at
+the top reserve space for an mpv X11 child frame. No extra Emacs window or
+unnamed preview buffer is created. Switching away from the editor hides its
+video, and switching back restores it. Other Emacs panes remain untouched.
+Only one video-edit session exists at a time. The video and text timeline share
+one buffer, visible by name through `switch-to-buffer` (`C-x b`).
 Ambiguous extensions such as `.ts` (TypeScript), `.mts`, and `.ogg` are not
 intercepted; use `M-x video-edit-open` for transport streams.
 
@@ -49,9 +56,17 @@ and remote files retain their usual Emacs behavior; `find-file-other-window`
 is unchanged. The package must be loaded with `(require 'video-edit-mode)`
 for automatic opening to take effect.
 
-On X11, the mpv player opens in an Emacs preview pane above the textual timeline (a native child
-frame backed by mpv). On other displays it opens as a separate window. No Python
-renderer or additional install step is needed.
+On X11, the mpv child frame overlays the first part of the editor's buffer,
+not a separate Emacs pane. The default video area occupies about 45% of the
+window's height; customize `video-edit-inline-preview-fraction` to change it.
+When the buffer is scrolled past its top, playback is temporarily hidden to
+avoid covering the edit rows. On other displays mpv uses a separate native
+window. No Python renderer or additional install step is needed.
+
+The embedded player's `q` and `Q` keystrokes are disabled so it cannot be quit
+independently of the editor by accident. Use the editor's `q` to quit the whole
+session. `v` can restart mpv after an unexpected exit or re-embed it when the
+editor moves to another graphical Emacs frame.
 
 ## Keys
 
@@ -143,24 +158,19 @@ requires a running X server. The package was statically checked here, but the
 Emacs executable was not available in the generation environment, so this
 specific Elisp version has **not yet been executed inside Emacs**.
 
-## X11 embedded player (v0.3)
+## X11 embedded player (v0.8)
 
-Graphical **X11** Emacs now opens a real mpv player **inside the Emacs
-frame** by default: a borderless Emacs child frame covers a preview pane,
-and mpv is launched with `--wid` targeting that native X window. No C,
-GUI toolkit, or new dependencies are required. The edit list stays in an
-ordinary Emacs buffer below the player. To disable embedding and use an
-external mpv window, customize `(setq video-edit-embed-mpv nil)`.
+Graphical X11 Emacs uses a real mpv X window embedded in a native Emacs child
+frame (`mpv --wid`), positioned over reserved lines **within the editor
+buffer's own Emacs window**. Unlike previous versions, there is no placeholder
+mpv buffer, split window, or separately navigable preview pane. `C-x b` away
+and back to the one editor buffer to hide and restore the video. The preview
+follows editor-window resizing; it is hidden when the editor scrolls beyond
+the reserved video area, so it doesn't cover the edit list. All its editing
+commands remain accessible below the video area.
 
-With your **mouse pointer inside the video**, mpv receives its own normal
-input (Space to pause, left/right to seek, etc.); move the pointer to the
-editor pane to use video-edit-mode's `i`, `o`, `d`, `r`, etc. The player
-therefore uses mpv's shortcuts, while the edit list uses Emacs's. X11's
-subwindow keyboard focus behavior is imperfect on some setups; it may be
-necessary to click the editor pane to return to Emacs. `v` restores a hidden preview pane or restarts mpv if it was closed. Resizing/splitting windows or
-resizing the top-level Emacs frame automatically repositions the player.
-
-The embedding uses an **Emacs child frame**, not an ordinary text widget:
-this is important because Emacs buffer windows have no independent X11
-window IDs. It is currently X11-specific; terminal Emacs and other
-window systems retain the old external mpv window.
+Moving the mouse over the video gives mpv its usual seek, pause, and speed
+keys. `q`/`Q` within mpv are disabled in embedded mode; use `q` in the
+textual editor to close video, mpv and the editor together. `v` restarts an
+unexpectedly exited player, or re-embeds after moving the editor between Emacs
+frames. Non-X11 Emacs and `video-edit-embed-mpv=nil` use an external mpv window.
