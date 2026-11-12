@@ -264,6 +264,84 @@
     (video-edit-undo)
     (should (= 1 (length video-edit--edits)))))
 
+(ert-deftest video-edit-unit-edit-only-navigation-and-highlight ()
+  "C-n/C-p stay on edit rows and highlight the selected row."
+  (with-temp-buffer
+    (video-edit-mode)
+    (setq video-edit--source "/tmp/example.mp4"
+          video-edit--info (video-edit-test--info)
+          video-edit--fps 30.0
+          video-edit--frames 300
+          video-edit--edits '((:start 10 :end 20 :kind "delete")
+                              (:start 30 :end 40 :kind "delete")
+                              (:start 50 :end 60 :kind "delete")))
+    (video-edit--refresh)
+    (save-excursion
+      (goto-char (point-min))
+      (search-forward "SPC pause")
+      (should-not (get-text-property (point) 'video-edit-index)))
+    (should (eq (lookup-key video-edit-mode-map (kbd "C-n"))
+                'video-edit-next-edit))
+    (should (eq (lookup-key video-edit-mode-map (kbd "C-p"))
+                'video-edit-previous-edit))
+    (let ((next (lookup-key video-edit-mode-map (kbd "C-n")))
+          (previous (lookup-key video-edit-mode-map (kbd "C-p"))))
+      ;; Enter the list from the heading and move only among edits.
+      (goto-char (point-min))
+      (call-interactively next)
+      (should (eql (get-text-property (point) 'video-edit-index) 0))
+      (should (overlayp video-edit--selection-overlay))
+      (should (eq (overlay-get video-edit--selection-overlay 'face)
+                  'video-edit-selected-edit))
+      (should (= (overlay-start video-edit--selection-overlay)
+                 (line-beginning-position)))
+      (call-interactively next)
+      (should (eql (get-text-property (point) 'video-edit-index) 1))
+      ;; A poll/refresh must not lose the selection or the highlight.
+      (setq video-edit--speed 1.5)
+      (video-edit--refresh)
+      (should (eql (get-text-property (point) 'video-edit-index) 1))
+      (should (= (overlay-start video-edit--selection-overlay)
+                 (line-beginning-position)))
+      (call-interactively next)
+      (call-interactively next)
+      (should (eql (get-text-property (point) 'video-edit-index) 2))
+      (call-interactively previous)
+      (call-interactively previous)
+      (call-interactively previous)
+      (should (eql (get-text-property (point) 'video-edit-index) 0))
+      ;; Navigating from outside the list goes to its nearest end.
+      (goto-char (point-max))
+      (call-interactively previous)
+      (should (eql (get-text-property (point) 'video-edit-index) 2))
+      ;; Ordinary point movements stop highlighting non-edit text.
+      (goto-char (point-min))
+      (video-edit--highlight-selection)
+      (should-not video-edit--selection-overlay)
+      (call-interactively next)
+      (should (eql (get-text-property (point) 'video-edit-index) 0))
+      ;; Deleting a selected row keeps the selection on a surviving row.
+      (call-interactively (lookup-key video-edit-mode-map (kbd "C-k")))
+      (should (= (length video-edit--edits) 2))
+      (should (eql (get-text-property (point) 'video-edit-index) 0))
+      (should (= (overlay-start video-edit--selection-overlay)
+                 (line-beginning-position))))))
+
+(ert-deftest video-edit-unit-edit-navigation-empty-list ()
+  "With no edits, navigation does not fall into GUI or help text."
+  (with-temp-buffer
+    (video-edit-mode)
+    (setq video-edit--source "/tmp/example.mp4"
+          video-edit--info (video-edit-test--info)
+          video-edit--fps 30.0
+          video-edit--frames 300)
+    (video-edit--refresh)
+    (let ((here (point)))
+      (video-edit-next-edit)
+      (video-edit-previous-edit)
+      (should (= (point) here))
+      (should-not video-edit--selection-overlay))))
+
 (ert-deftest video-edit-unit-speed-display-tracks-mpv ()
   "The display reflects external mpv speed changes even when paused."
   (with-temp-buffer

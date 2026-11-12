@@ -1,6 +1,6 @@
 ;;; video-edit-mode.el --- Keyboard-driven video cuts and replacements -*- lexical-binding: t; -*-
 
-;; Version: 0.6.0
+;; Version: 0.7.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: multimedia, convenience
 
@@ -18,6 +18,10 @@
 (require 'subr-x)
 
 (defgroup video-edit nil "Minimal MPV/FFmpeg video editor." :group 'multimedia)
+(defface video-edit-selected-edit
+  '((t (:inherit highlight :extend t)))
+  "Face for the currently selected edit in the timeline."
+  :group 'video-edit)
 (defcustom video-edit-mpv "mpv" "MPV executable." :type 'string)
 (defcustom video-edit-ffmpeg "ffmpeg" "FFmpeg executable." :type 'string)
 (defcustom video-edit-ffprobe "ffprobe" "ffprobe executable." :type 'string)
@@ -56,6 +60,7 @@ Set this to nil to restore ordinary `find-file' behavior for videos and projects
 (defvar-local video-edit--display-frame nil)
 (defvar-local video-edit--edits nil)
 (defvar-local video-edit--history nil)
+(defvar-local video-edit--selection-overlay nil)
 (defvar-local video-edit--project-file nil)
 (defvar-local video-edit--mpv nil)
 (defvar-local video-edit--ipc nil)
@@ -179,10 +184,55 @@ Set this to nil to restore ordinary `find-file' behavior for videos and projects
     (aset line (funcall index video-edit--position) ?|)
     line))
 
+(defun video-edit--edit-row-position (index)
+  "Return the beginning of edit row INDEX, or nil if it is not displayed."
+  (text-property-any (point-min) (point-max) 'video-edit-index index))
+
+(defun video-edit--highlight-selection ()
+  "Highlight the edit at point, and no other portion of the buffer."
+  (let ((index (get-text-property (point) 'video-edit-index)))
+    (if (integerp index)
+        (progn
+          (unless (overlayp video-edit--selection-overlay)
+            (setq video-edit--selection-overlay (make-overlay (point) (point)))
+            (overlay-put video-edit--selection-overlay 'face 'video-edit-selected-edit)
+            (overlay-put video-edit--selection-overlay 'priority 100))
+          (move-overlay video-edit--selection-overlay
+                        (line-beginning-position)
+                        (min (point-max) (1+ (line-end-position)))
+                        (current-buffer)))
+      (when (overlayp video-edit--selection-overlay)
+        (delete-overlay video-edit--selection-overlay)
+        (setq video-edit--selection-overlay nil)))))
+
+(defun video-edit-next-edit (&optional count)
+  "Select the next COUNT edits, without entering the header or help text.
+From outside the edit list, select the first edit (or last if COUNT
+is negative).  At either boundary, stay on the boundary edit."
+  (interactive "p")
+  (let* ((count (or count 1))
+         (size (length video-edit--edits))
+         (current (get-text-property (point) 'video-edit-index)))
+    (if (zerop size)
+        (message "video-edit: no edits to navigate")
+      (let* ((target (max 0 (min (1- size)
+                                 (if (integerp current) (+ current count)
+                                   (if (< count 0) (+ size count) (1- count))))))
+             (position (video-edit--edit-row-position target)))
+        (unless position (error "Cannot locate edit row %d" target))
+        (goto-char position)
+        (video-edit--highlight-selection)))))
+
+(defun video-edit-previous-edit (&optional count)
+  "Select the previous COUNT edits; stay on the first edit at the boundary."
+  (interactive "p")
+  (video-edit-next-edit (- (or count 1))))
+
 (defun video-edit--refresh ()
   (let* ((inhibit-read-only t)
          (line (line-number-at-pos))
          (col (current-column))
+         (selected (get-text-property (point) 'video-edit-index))
          (modified (buffer-modified-p)))
     (erase-buffer)
     (insert (propertize "VIDEO EDIT  " 'face 'bold)
@@ -210,17 +260,26 @@ Set this to nil to restore ordinary `find-file' behavior for videos and projects
                                    (plist-get e :kind)
                                    (if-let ((file (plist-get e :path)))
                                        (abbreviate-file-name file) "")))
-                   (add-text-properties begin (point) `(video-edit-index ,i))))
+                   ;; Do not let the edit index propagate into following text
+                   ;; (especially the help lines after the final edit).
+                   (add-text-properties begin (point)
+                                        `(video-edit-index ,i
+                                          rear-nonsticky (video-edit-index)))))
       (insert " (none)\n"))
     (insert "\nSPC pause  arrows seek 5/60s  ,/. step frame  M-arrows 1sec\n"
             "[ ] speed -/+  { } speed half/double  DEL speed 1x\n"
             "i/o set marks  k clear marks\n"
             "d delete  r video/keep audio  R video+audio  C-k remove edit\n"
-            "RET seek to edit  u undo\n"
+            "C-n/C-p select next/previous edit  RET seek to edit  u undo\n"
             "j jump to time  e export  p preview  v show player  C-x C-s save  q close\n")
-    (goto-char (point-min))
-    (forward-line (1- line))
-    (move-to-column col)
+    (if (and (integerp selected) video-edit--edits)
+        (goto-char (or (video-edit--edit-row-position
+                        (min selected (1- (length video-edit--edits))))
+                       (point-min)))
+      (goto-char (point-min))
+      (forward-line (1- line))
+      (move-to-column col))
+    (video-edit--highlight-selection)
     (set-buffer-modified-p modified)))
 
 (defun video-edit--ipc-filter (process text)
@@ -1150,6 +1209,8 @@ For external playback, restart mpv if needed."
     (define-key map (kbd "o") #'video-edit-set-out)
     (define-key map (kbd "k") #'video-edit-clear-marks)
     (define-key map (kbd "C-k") #'video-edit-remove-edit)
+    (define-key map (kbd "C-n") #'video-edit-next-edit)
+    (define-key map (kbd "C-p") #'video-edit-previous-edit)
     (define-key map (kbd "d") #'video-edit-delete)
     (define-key map (kbd "r") #'video-edit-replace-video)
     (define-key map (kbd "R") #'video-edit-replace-both)
@@ -1174,6 +1235,7 @@ For external playback, restart mpv if needed."
   "Edit source-frame intervals with MPV and FFmpeg."
   (setq-local truncate-lines t)
   (setq-local mode-line-process '(:eval video-edit--render-status))
+  (add-hook 'post-command-hook #'video-edit--highlight-selection nil t)
   (add-hook 'kill-buffer-hook #'video-edit--cleanup nil t))
 
 ;; Register at load time, so even large videos are never read as binary text.

@@ -1,4 +1,4 @@
-# video-edit-mode.el 0.6.0 — Emacs-only editor with X11 embedding
+# video-edit-mode.el 0.7.0 — Emacs-only editor with X11 embedding
 
 Minimal, local, keyboard-driven video editing. **No Python, shell scripts,
 Emacs packages, GTK, Qt, or desktop environment.** Only three external
@@ -71,7 +71,8 @@ renderer or additional install step is needed.
 | `d` | Ripple-delete both original video and audio between the markers |
 | `r` | Replace marked video with image/video file, keep original audio |
 | `R` | Replace marked video and audio with another video file |
-| `C-k` | Remove the edit on the current edit-list line |
+| `C-n` / `C-p` | Select next/previous edit; stop at the first/last edit |
+| `C-k` | Remove the selected edit |
 | `RET` | Seek to edit on current line |
 | `u` | Undo edit-list change |
 | `v` | Restore the player pane or restart mpv if it was quit |
@@ -80,6 +81,9 @@ renderer or additional install step is needed.
 | `l` | Show FFmpeg diagnostics for the latest export/preview |
 | `C-x C-s` | Save project as `.ved.json` |
 | `q` | Close editor and original MPV window |
+
+The selected edit row is highlighted.  Playback updates and redraws preserve
+the selection, and `C-n`/`C-p` skip the header, timeline and help text.
 
 The editor displays the current playback speed next to the playback position,
 including speed changes made with mpv shortcuts inside the embedded player.
