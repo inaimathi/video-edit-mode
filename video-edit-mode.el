@@ -1,6 +1,6 @@
 ;;; video-edit-mode.el --- Keyboard-driven video cuts and replacements -*- lexical-binding: t; -*-
 
-;; Version: 0.3.0
+;; Version: 0.6.0
 ;; Package-Requires: ((emacs "28.1"))
 ;; Keywords: multimedia, convenience
 
@@ -10,7 +10,7 @@
 ;; No Python, third-party Elisp, GTK, Qt, or shell interpreter is required.
 ;; On X11, a native Emacs child frame hosts an embedded mpv X window.
 ;; External executables: mpv, ffprobe, ffmpeg.
-;; C-x C-f a video file (or M-x video-edit-open); use i/o, d/r/R, e.
+;; C-x C-f a video or .ved.json project; use i/o, d/r/R, e.
 
 ;;; Code:
 (require 'cl-lib)
@@ -32,12 +32,15 @@ On text terminals or non-X11 graphical systems, use a separate mpv window."
 (defcustom video-edit-auto-open t
   "If non-nil, `find-file' opens local video files in `video-edit-mode'.
 The source is not loaded into an Emacs buffer or overwritten on save.
-Set this to nil to restore ordinary `find-file' behavior for videos."
+Set this to nil to restore ordinary `find-file' behavior for videos and projects."
   :type 'boolean)
 
 (defconst video-edit--video-file-regexp
   "\\.\\(?:mp4\\|m4v\\|mkv\\|webm\\|ogv\\|mov\\|avi\\|mpg\\|mpeg\\|m2ts\\|flv\\|wmv\\|3gp\\)\\'"
-  "Extensions handled by video editing when using `find-file'.")
+  "Video extensions handled by `find-file'.")
+
+(defconst video-edit--project-file-regexp "\\.ved\\.json\\'"
+  "Project extension handled by `find-file'.")
 
 (defconst video-edit--image-extensions
   '("png" "jpg" "jpeg" "bmp" "webp" "tif" "tiff"))
@@ -49,6 +52,7 @@ Set this to nil to restore ordinary `find-file' behavior for videos."
 (defvar-local video-edit--in nil)
 (defvar-local video-edit--out nil)
 (defvar-local video-edit--position 0)
+(defvar-local video-edit--speed 1.0)
 (defvar-local video-edit--display-frame nil)
 (defvar-local video-edit--edits nil)
 (defvar-local video-edit--history nil)
@@ -60,6 +64,7 @@ Set this to nil to restore ordinary `find-file' behavior for videos."
 (defvar-local video-edit--poll-timer nil)
 (defvar-local video-edit--render-process nil)
 (defvar-local video-edit--render-log nil)
+(defvar-local video-edit--render-status nil)
 (defvar-local video-edit--preview-buffer nil)
 (defvar-local video-edit--preview-host nil)
 (defvar-local video-edit--preview-parent nil)
@@ -188,8 +193,9 @@ Set this to nil to restore ordinary `find-file' behavior for videos."
                     (gethash "height" video-edit--info)
                     video-edit--fps
                     (if (gethash "has_audio" video-edit--info) "audio" "silent"))
-            (format "Position: %s    IN: %s    OUT: %s\n"
+            (format "Position: %s    Speed: %.2fx    IN: %s    OUT: %s\n"
                     (video-edit--timestamp video-edit--position)
+                    video-edit--speed
                     (if video-edit--in (video-edit--timestamp video-edit--in) "-")
                     (if video-edit--out (video-edit--timestamp video-edit--out) "-"))
             "|" (video-edit--timeline) "|\n"
@@ -206,9 +212,11 @@ Set this to nil to restore ordinary `find-file' behavior for videos."
                                        (abbreviate-file-name file) "")))
                    (add-text-properties begin (point) `(video-edit-index ,i))))
       (insert " (none)\n"))
-    (insert "\nSPC play/pause  arrows frame  M-arrows 1sec  i/o mark\n"
-            "[ ] nudge IN  { } nudge OUT   d delete   r video/keep audio\n"
-            "R video+audio  k remove edit  RET seek to edit  u undo\n"
+    (insert "\nSPC pause  arrows seek 5/60s  ,/. step frame  M-arrows 1sec\n"
+            "[ ] speed -/+  { } speed half/double  DEL speed 1x\n"
+            "i/o set marks  k clear marks\n"
+            "d delete  r video/keep audio  R video+audio  C-k remove edit\n"
+            "RET seek to edit  u undo\n"
             "j jump to time  e export  p preview  v show player  C-x C-s save  q close\n")
     (goto-char (point-min))
     (forward-line (1- line))
@@ -256,6 +264,18 @@ Set this to nil to restore ordinary `find-file' behavior for videos."
            (setq video-edit--position (video-edit--frame seconds))
            (funcall callback video-edit--position)))))))
 
+(defun video-edit--query-speed ()
+  "Query mpv playback speed, including changes made in the video window."
+  (let ((buffer (current-buffer)))
+    (video-edit--ipc-send
+     '("get_property" "speed")
+     (lambda (speed)
+       (when (and (buffer-live-p buffer) (numberp speed))
+         (with-current-buffer buffer
+           (unless (= speed video-edit--speed)
+             (setq video-edit--speed speed)
+             (video-edit--refresh))))))))
+
 (defun video-edit--connect (buffer)
   (when (buffer-live-p buffer)
     (with-current-buffer buffer
@@ -285,6 +305,7 @@ Set this to nil to restore ordinary `find-file' behavior for videos."
     (with-current-buffer buffer
       (video-edit--preview-sync)
       (when (process-live-p video-edit--ipc)
+        (video-edit--query-speed)
         (video-edit--query-position
          (lambda (frame)
            (unless (equal frame video-edit--display-frame)
@@ -425,6 +446,7 @@ Return the host frame's XID as a string, or nil if embedding is unavailable."
           (list (concat "--input-ipc-server=" socket) source)))
 
 (defun video-edit--start-mpv ()
+  (setq video-edit--speed 1.0)
   (let ((exe (video-edit--executable video-edit-mpv))
         (buffer (current-buffer)))
     (setq video-edit--socket-dir (make-temp-file "video-edit-mpv-" t))
@@ -478,7 +500,9 @@ Return the host frame's XID as a string, or nil if embedding is unavailable."
         (error (kill-buffer buffer) (signal (car err) (cdr err)))))
     ;; A native preview requires a displayed Emacs window before the child
     ;; frame can be positioned.  Launch mpv only after displaying the editor.
-    (pop-to-buffer buffer)
+    ;; Respect the window from which `find-file' (or `video-edit-open') was
+    ;; invoked.  `pop-to-buffer' may choose an unrelated side window.
+    (switch-to-buffer buffer)
     (condition-case err
         (with-current-buffer buffer (video-edit--start-mpv))
       (error (kill-buffer buffer) (signal (car err) (cdr err))))
@@ -502,12 +526,12 @@ Reuse an existing editor for the same source file."
   (interactive "fVideo file: ")
   (let ((buffer (video-edit--existing-editor source)))
     (if buffer
-        (progn (pop-to-buffer buffer) buffer)
+        (progn (switch-to-buffer buffer) buffer)
       (video-edit--new source))))
 
 (defun video-edit--find-file-advice (original filename &optional wildcards)
-  "Visit video FILENAME with the editor; otherwise call ORIGINAL.
-Avoid the ordinary binary-file read (which can be huge).  Only intercept
+  "Visit video or project FILENAME with the editor; otherwise call ORIGINAL.
+Avoid loading binary video data into an Emacs buffer.  Only intercept
 existing local regular files; WILDCARDS is passed through if expansion
 is requested.  Literal visits and other `find-file' variants are unchanged."
   (if (and video-edit-auto-open
@@ -515,28 +539,77 @@ is requested.  Literal visits and other `find-file' variants are unchanged."
            ;; Interactive `find-file` passes WILDCARDS=t even for plain paths.
            (not (and wildcards find-file-wildcards
                      (string-match-p "[][?*]" filename)))
-           (string-match-p video-edit--video-file-regexp (downcase filename))
            (not (file-remote-p filename))
            (file-regular-p filename))
-      (video-edit-open filename)
+      (let ((name (downcase filename)))
+        (cond ((string-match-p video-edit--project-file-regexp name)
+               (video-edit-open-project filename))
+              ((string-match-p video-edit--video-file-regexp name)
+               (video-edit-open filename))
+              (t (funcall original filename wildcards))))
     (funcall original filename wildcards)))
+
+(defun video-edit--existing-project (file)
+  "Find an open editor for project FILE, without losing unsaved edits."
+  (let ((canonical (file-truename file)))
+    (cl-find-if
+     (lambda (buffer)
+       (with-current-buffer buffer
+         (and (eq major-mode 'video-edit-mode)
+              video-edit--project-file
+              (file-regular-p video-edit--project-file)
+              (equal canonical (file-truename video-edit--project-file)))))
+     (buffer-list))))
+
+(defun video-edit--project-path (path project)
+  "Expand PATH relative to PROJECT's directory, preserving ~/ paths."
+  (when (stringp path)
+    (expand-file-name path (file-name-directory project))))
 
 ;;;###autoload
 (defun video-edit-open-project (file)
-  "Open a saved .ved.json FILE."
+  "Open a saved .ved.json FILE and restore all edits.
+Relative source and replacement paths resolve against the project directory.
+An already-open project is selected instead of losing unsaved edits."
   (interactive "fProject (.ved.json): ")
-  (let* ((data (with-temp-buffer
-                 (insert-file-contents file)
-                 (json-parse-buffer :object-type 'hash-table :array-type 'list
-                                    :null-object nil :false-object nil)))
-         (edits (mapcar
-                 (lambda (e)
-                   (list :start (gethash "start" e)
-                         :end (gethash "end" e)
-                         :kind (gethash "kind" e)
-                         :path (gethash "path" e)))
-                 (gethash "edits" data))))
-    (video-edit--new (gethash "source" data) edits (expand-file-name file))))
+  (let* ((project (expand-file-name file))
+         (existing (and (file-regular-p project)
+                        (video-edit--existing-project project))))
+    (if existing
+        (progn (switch-to-buffer existing) existing)
+      (unless (file-regular-p project)
+        (user-error "Video-edit project does not exist: %s" project))
+      (let* ((data (condition-case err
+                       (with-temp-buffer
+                         (insert-file-contents project)
+                         (json-parse-buffer :object-type 'hash-table
+                                            :array-type 'list
+                                            :null-object nil :false-object nil))
+                     (error (user-error "Cannot read video-edit project %s: %s"
+                                        project (error-message-string err)))))
+             (version (and (hash-table-p data) (gethash "version" data)))
+             (stored-source (and (hash-table-p data) (gethash "source" data)))
+             (saved-edits (and (hash-table-p data) (gethash "edits" data))))
+        (unless (equal version 1)
+          (user-error "Unsupported video-edit project version: %S" version))
+        (unless (and (stringp stored-source) (not (string-empty-p stored-source)))
+          (user-error "Project has no source video: %s" project))
+        (let ((source (video-edit--project-path stored-source project)))
+          (unless (file-regular-p source)
+            (user-error "Project source video is missing: %s" source))
+          (unless (listp saved-edits)
+            (user-error "Invalid edits in video-edit project: %s" project))
+          (let ((edits (mapcar
+                        (lambda (edit)
+                          (unless (hash-table-p edit)
+                            (user-error "Invalid edit in video-edit project: %s" project))
+                          (list :start (gethash "start" edit)
+                                :end (gethash "end" edit)
+                                :kind (gethash "kind" edit)
+                                :path (video-edit--project-path
+                                       (gethash "path" edit) project)))
+                        saved-edits)))
+            (video-edit--new source edits project)))))))
 
 (defun video-edit-play-pause ()
   "Toggle playback."
@@ -554,9 +627,16 @@ is requested.  Literal visits and other `find-file' variants are unchanged."
   "Seek to source time SECONDS."
   (video-edit--ipc-send (list "seek" seconds "absolute" "exact")))
 (defun video-edit-seek-by (seconds)
-  "Seek relative to source position by SECONDS."
+  "Seek relative to source position by SECONDS without changing pause state."
   (interactive "nSeconds (relative): ")
   (video-edit--ipc-send (list "seek" seconds "relative" "exact")))
+(defun video-edit-speed-multiply (factor)
+  "Multiply mpv playback speed by FACTOR without changing pause state."
+  (video-edit--ipc-send (list "multiply" "speed" factor)))
+(defun video-edit-speed-reset ()
+  "Reset mpv playback speed to normal (1x)."
+  (interactive)
+  (video-edit--ipc-send '("set_property" "speed" 1.0)))
 (defun video-edit-jump-time (time)
   "Jump to source position TIME: SS, MM:SS, or HH:MM:SS[.sss]."
   (interactive (list (read-string "Source time: "
@@ -577,15 +657,11 @@ is requested.  Literal visits and other `find-file' variants are unchanged."
   (interactive)
   (video-edit--query-position (lambda (frame) (setq video-edit--out frame)
                                 (video-edit--refresh))))
-(defun video-edit-nudge (which delta)
-  "Nudge marker WHICH by DELTA frames, seeking playback to the marker."
-  (let ((current (if (eq which 'in) video-edit--in video-edit--out)))
-    (unless current (user-error "Set %s marker first" which))
-    (let ((next (max 0 (min video-edit--frames (+ current delta)))))
-      (if (eq which 'in) (setq video-edit--in next) (setq video-edit--out next))
-      (video-edit-seek (video-edit--seconds next))
-      (setq video-edit--position next)
-      (video-edit--refresh))))
+(defun video-edit-clear-marks ()
+  "Clear both IN and OUT markers without changing the edit list."
+  (interactive)
+  (setq video-edit--in nil video-edit--out nil)
+  (video-edit--refresh))
 
 (defun video-edit--marked-region ()
   (unless (and video-edit--in video-edit--out)
@@ -602,7 +678,7 @@ is requested.  Literal visits and other `find-file' variants are unchanged."
                      (and (< start (plist-get e :end))
                           (< (plist-get e :start) end)))
                    video-edit--edits)
-      (user-error "Overlapping edit: remove the old edit with k, or undo first"))
+      (user-error "Overlapping edit: remove the old edit with C-k, or undo first"))
     (push (copy-tree video-edit--edits) video-edit--history)
     (push (list :start start :end end :kind kind :path file) video-edit--edits)
     (setq video-edit--edits
@@ -659,7 +735,10 @@ is requested.  Literal visits and other `find-file' variants are unchanged."
          (dest (or filename video-edit--project-file
                    (read-file-name "Save project: " nil default nil
                                    (file-name-nondirectory default)))))
-    (with-temp-file dest (insert (video-edit--to-json) "\n"))
+    ;; `with-temp-file' changes the current buffer.  Serialize *before* it,
+    ;; while our buffer-local source and edits are still accessible.
+    (let ((json (video-edit--to-json)))
+      (with-temp-file dest (insert json "\n")))
     (setq video-edit--project-file (expand-file-name dest))
     (set-buffer-modified-p nil)
     (message "Saved project: %s" dest)))
@@ -831,18 +910,115 @@ No shell commands are involved."
         (user-error "Output cannot overwrite replacement: %s" output)))
     output))
 
+(defun video-edit--render-command (plan filter-file output)
+  "Return the FFmpeg argv for PLAN, FILTER-FILE and OUTPUT.
+FFmpeg sends machine-readable progress to stdout and diagnostics to stderr."
+  (append
+   (list (video-edit--executable video-edit-ffmpeg))
+   (plist-get plan :args)
+   (list "-nostdin" "-nostats" "-loglevel" "warning"
+         "-stats_period" "1" "-progress" "pipe:1"
+         "-filter_complex_script" filter-file
+         "-map" "[vout]" "-map" "[aout]"
+         "-map_metadata" "-1" "-c:v" "libx264"
+         "-preset" (plist-get plan :preset)
+         "-crf" (number-to-string (plist-get plan :crf))
+         "-pix_fmt" "yuv420p"
+         "-c:a" "aac" "-b:a" "192k" "-ar" "48000"
+         "-movflags" "+faststart"
+         "-t" (format "%.9f" (plist-get plan :duration))
+         "-f" "mp4" output)))
+
+(defun video-edit--progress-seconds (stamp)
+  "Parse FFmpeg -progress out_time timestamp STAMP into seconds."
+  (when (and (stringp stamp)
+             (string-match
+              "\\`\\([0-9]+\\):\\([0-9]+\\):\\([0-9]+\\(?:\\.[0-9]+\\)?\\)\\'"
+              stamp))
+    (+ (* 3600 (string-to-number (match-string 1 stamp)))
+       (* 60 (string-to-number (match-string 2 stamp)))
+       (string-to-number (match-string 3 stamp)))))
+
+(defun video-edit--progress-clock (seconds)
+  "Format SECONDS as HH:MM:SS for a rendering progress display."
+  (let* ((whole (max 0 (floor seconds)))
+         (hours (/ whole 3600))
+         (minutes (% (/ whole 60) 60))
+         (secs (% whole 60)))
+    (format "%02d:%02d:%02d" hours minutes secs)))
+
+(defun video-edit--progress-description (elapsed duration speed)
+  "Format a progress bar for ELAPSED seconds of DURATION and FFmpeg SPEED."
+  (let* ((fraction (if (> duration 0)
+                       (max 0.0 (min 1.0 (/ (float elapsed) duration)))
+                     0.0))
+         (count (floor (* 20 fraction)))
+         (bar (concat (make-string count ?#) (make-string (- 20 count) ?-))))
+    (format "[%s] %3d%% %s/%s%s" bar (round (* fraction 100))
+            (video-edit--progress-clock elapsed)
+            (video-edit--progress-clock duration)
+            (if (and speed (not (member speed '("N/A" "0x"))))
+                (concat " " speed) ""))))
+
+(defun video-edit--render-progress-update (editor duration elapsed speed label)
+  "Display rendering status for EDITOR, DURATION, ELAPSED, SPEED and LABEL."
+  (when (buffer-live-p editor)
+    (let* ((percent (if (> duration 0)
+                        (round (* 100 (max 0.0 (min 1.0 (/ (float elapsed) duration)))))
+                      0))
+           (status (video-edit--progress-description elapsed duration speed)))
+      (with-current-buffer editor
+        (setq video-edit--render-status (format " %s %d%%" label percent))
+        (force-mode-line-update))
+      (message "video-edit %s: %s" label status))))
+
+(defun video-edit--render-progress-filter (process chunk editor duration label)
+  "Consume partial FFmpeg progress CHUNK from PROCESS without displaying it.
+EDITOR is the source buffer; DURATION is the edited output length in seconds.
+LABEL identifies an export or preview.  Handle stdout split at any byte."
+  (let ((pending (concat (or (process-get process 'video-edit-pending) "") chunk)))
+    (while (string-match "\n" pending)
+      (let ((line (string-trim-right (substring pending 0 (match-beginning 0)) "\r")))
+        (setq pending (substring pending (match-end 0)))
+        (when (string-match "\\`\\([^=]+\\)=\\(.*\\)\\'" line)
+          (let ((key (match-string 1 line))
+                (value (match-string 2 line)))
+            (pcase key
+              ("out_time" (process-put process 'video-edit-out-time value))
+              ("speed" (process-put process 'video-edit-speed (string-trim value)))
+              ("progress"
+               (when (member value '("continue" "end"))
+                 (let ((elapsed (if (equal value "end") duration
+                                  (or (video-edit--progress-seconds
+                                       (process-get process 'video-edit-out-time))
+                                      0))))
+                   (video-edit--render-progress-update
+                    editor duration elapsed
+                    (process-get process 'video-edit-speed) label)))))))))
+    (process-put process 'video-edit-pending pending)))
+
+(defun video-edit-show-render-log ()
+  "Display FFmpeg diagnostics from the most recent export or preview."
+  (interactive)
+  (if (buffer-live-p video-edit--render-log)
+      (display-buffer video-edit--render-log)
+    (user-error "No FFmpeg render log yet")))
+
 (defun video-edit--run-render (output height preview)
   "Render the current timeline asynchronously to OUTPUT.
 HEIGHT is the maximum resolution height, or nil for original resolution.
-PREVIEW means use faster encoding and open the result in MPV."
+PREVIEW means use faster encoding and open the result in MPV.
+Progress is shown in the echo area and mode line; errors go to the log."
   (when (process-live-p video-edit--render-process)
-    (user-error "Render already running; see *video-edit-render*"))
+    (user-error "Render already running"))
   (let* ((output (video-edit--render-validate-output output))
          (plan (video-edit--render-build video-edit--source video-edit--edits height
                                          (if preview 27 video-edit-crf)
                                          (if preview "ultrafast" video-edit-preset)))
          (filter-file (make-temp-file "video-edit-filter-" nil ".txt"))
          (editor (current-buffer))
+         (duration (plist-get plan :duration))
+         (label (if preview "Preview" "Export"))
          (log (get-buffer-create "*video-edit-render*")))
     (condition-case err
         (progn
@@ -850,47 +1026,49 @@ PREVIEW means use faster encoding and open the result in MPV."
           (with-current-buffer log
             (let ((inhibit-read-only t))
               (erase-buffer)
-              (insert (format "Rendering %s\n" output))))
+              (insert (format "Rendering %s\n\nFFmpeg diagnostics:\n" output))))
           (setq video-edit--render-log log)
           (setq video-edit--render-process
                 (make-process
-                 :name "video-edit-render" :buffer log :noquery t
-                 :command (append
-                           (list (video-edit--executable video-edit-ffmpeg))
-                           (plist-get plan :args)
-                           (list "-filter_complex_script" filter-file
-                                 "-map" "[vout]" "-map" "[aout]"
-                                 "-map_metadata" "-1" "-c:v" "libx264"
-                                 "-preset" (plist-get plan :preset)
-                                 "-crf" (number-to-string (plist-get plan :crf))
-                                 "-pix_fmt" "yuv420p"
-                                 "-c:a" "aac" "-b:a" "192k" "-ar" "48000"
-                                 "-movflags" "+faststart"
-                                 "-t" (format "%.9f" (plist-get plan :duration))
-                                 "-f" "mp4" output))
+                 :name "video-edit-render" :buffer nil :stderr log :noquery t
+                 :connection-type 'pipe :coding 'utf-8-unix
+                 :command (video-edit--render-command plan filter-file output)
+                 :filter (lambda (proc text)
+                           (video-edit--render-progress-filter
+                            proc text editor duration label))
                  :sentinel
                  (lambda (proc _event)
                    (when (memq (process-status proc) '(exit signal))
                      (ignore-errors (delete-file filter-file))
-                     (when (buffer-live-p editor)
-                       (with-current-buffer editor
-                         (if (= (process-exit-status proc) 0)
-                             (progn
-                               (message "Rendered: %s" output)
-                               (when preview
-                                 (make-process
-                                  :name "video-edit-preview" :noquery t
-                                  :command (list (video-edit--executable video-edit-mpv)
-                                                 "--no-config" output)
-                                  :sentinel (lambda (player _event)
-                                              (when (memq (process-status player) '(exit signal))
-                                                (ignore-errors (delete-file output)))))))
-                           (when preview (ignore-errors (delete-file output)))
-                           (message "Render failed; see *video-edit-render*"))))))))
-          (display-buffer log)
-          (message "Rendering %s (see *video-edit-render*)" output))
-      (error (ignore-errors (delete-file filter-file))
-             (signal (car err) (cdr err))))))
+                     (let ((success (and (eq (process-status proc) 'exit)
+                                         (zerop (process-exit-status proc)))))
+                       (when (buffer-live-p editor)
+                         (with-current-buffer editor
+                           (setq video-edit--render-process nil
+                                 video-edit--render-status
+                                 (if success (format " %s done" label)
+                                   (format " %s FAILED" label)))
+                           (force-mode-line-update)))
+                       (if success
+                           (progn
+                             (message "%s complete: %s" label output)
+                             (when preview
+                               (make-process
+                                :name "video-edit-preview" :noquery t
+                                :command (list (video-edit--executable video-edit-mpv)
+                                               "--no-config" output)
+                                :sentinel (lambda (player _event)
+                                            (when (memq (process-status player) '(exit signal))
+                                              (ignore-errors (delete-file output)))))))
+                         (when preview (ignore-errors (delete-file output)))
+                         (message "%s failed; press l for FFmpeg diagnostics" label)))))))
+          (video-edit--render-progress-update editor duration 0 nil label))
+      (error
+       (ignore-errors (delete-file filter-file))
+       (setq video-edit--render-process nil
+             video-edit--render-status nil)
+       (force-mode-line-update)
+       (signal (car err) (cdr err))))))
 
 (defun video-edit-export (output resolution)
   "Export MP4 to OUTPUT with RESOLUTION height (0 means source dimensions)."
@@ -946,38 +1124,56 @@ For external playback, restart mpv if needed."
   (set-buffer-modified-p nil)
   (kill-buffer (current-buffer)))
 
-(defvar video-edit-mode-map
-  (let ((map (make-sparse-keymap)))
+(defvar video-edit-mode-map nil "Keymap for `video-edit-mode'.")
+
+;; Rebuild on reload as well as on first load; iterative Elisp development
+;; otherwise leaves the old shortcuts in the already-bound `defvar'.
+(setq video-edit-mode-map
+      (let ((map (make-sparse-keymap)))
     (define-key map (kbd "SPC") #'video-edit-play-pause)
-    (define-key map (kbd "<right>") #'video-edit-next-frame)
-    (define-key map (kbd "<left>") #'video-edit-previous-frame)
+    (define-key map (kbd "<right>") (lambda () (interactive) (video-edit-seek-by 5)))
+    (define-key map (kbd "<left>") (lambda () (interactive) (video-edit-seek-by -5)))
+    (define-key map (kbd "<up>") (lambda () (interactive) (video-edit-seek-by 60)))
+    (define-key map (kbd "<down>") (lambda () (interactive) (video-edit-seek-by -60)))
     (define-key map (kbd "M-<right>") (lambda () (interactive) (video-edit-seek-by 1)))
     (define-key map (kbd "M-<left>") (lambda () (interactive) (video-edit-seek-by -1)))
+    (define-key map (kbd ",") #'video-edit-previous-frame)
+    (define-key map (kbd ".") #'video-edit-next-frame)
+    (define-key map (kbd "[") (lambda () (interactive) (video-edit-speed-multiply (/ 1.0 1.1))))
+    (define-key map (kbd "]") (lambda () (interactive) (video-edit-speed-multiply 1.1)))
+    (define-key map (kbd "{") (lambda () (interactive) (video-edit-speed-multiply 0.5)))
+    (define-key map (kbd "}") (lambda () (interactive) (video-edit-speed-multiply 2.0)))
+    (define-key map (kbd "DEL") #'video-edit-speed-reset)
+    (define-key map (kbd "<backspace>") #'video-edit-speed-reset)
     (define-key map (kbd "j") #'video-edit-jump-time)
     (define-key map (kbd "i") #'video-edit-set-in)
     (define-key map (kbd "o") #'video-edit-set-out)
-    (define-key map (kbd "[") (lambda () (interactive) (video-edit-nudge 'in -1)))
-    (define-key map (kbd "]") (lambda () (interactive) (video-edit-nudge 'in 1)))
-    (define-key map (kbd "{") (lambda () (interactive) (video-edit-nudge 'out -1)))
-    (define-key map (kbd "}") (lambda () (interactive) (video-edit-nudge 'out 1)))
+    (define-key map (kbd "k") #'video-edit-clear-marks)
+    (define-key map (kbd "C-k") #'video-edit-remove-edit)
     (define-key map (kbd "d") #'video-edit-delete)
     (define-key map (kbd "r") #'video-edit-replace-video)
     (define-key map (kbd "R") #'video-edit-replace-both)
     (define-key map (kbd "u") #'video-edit-undo)
-    (define-key map (kbd "k") #'video-edit-remove-edit)
     (define-key map (kbd "RET") #'video-edit-jump-to-edit)
     (define-key map (kbd "e") #'video-edit-export)
+    (define-key map (kbd "l") #'video-edit-show-render-log)
     (define-key map (kbd "p") #'video-edit-preview)
     (define-key map (kbd "v") #'video-edit-show-player)
     (define-key map (kbd "g") #'video-edit--refresh)
     (define-key map (kbd "C-x C-s") #'video-edit-save-project)
     (define-key map (kbd "q") #'video-edit-quit)
-    map)
-  "Keymap for `video-edit-mode'.")
+    map))
+
+;; A loaded editor buffer retains its old local keymap across `load-file'.
+(dolist (buffer (buffer-list))
+  (with-current-buffer buffer
+    (when (eq major-mode 'video-edit-mode)
+      (use-local-map video-edit-mode-map))))
 
 (define-derived-mode video-edit-mode special-mode "Video-Edit"
   "Edit source-frame intervals with MPV and FFmpeg."
   (setq-local truncate-lines t)
+  (setq-local mode-line-process '(:eval video-edit--render-status))
   (add-hook 'kill-buffer-hook #'video-edit--cleanup nil t))
 
 ;; Register at load time, so even large videos are never read as binary text.

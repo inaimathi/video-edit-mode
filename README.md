@@ -1,4 +1,4 @@
-# video-edit-mode.el 0.3.0 — Emacs-only editor with X11 embedding
+# video-edit-mode.el 0.6.0 — Emacs-only editor with X11 embedding
 
 Minimal, local, keyboard-driven video editing. **No Python, shell scripts,
 Emacs packages, GTK, Qt, or desktop environment.** Only three external
@@ -30,8 +30,16 @@ M-x load-file RET /path/to/video-edit-mode.el RET
 Open a local video with ordinary `C-x C-f` / `find-file` (for example
 `.mp4`, `.mkv`, `.ogv`, `.webm`, `.mov`, or `.avi`). The editor intercepts
 `find-file` **before Emacs loads the binary video into a text buffer**.
-The source stays untouched; `C-x C-s` saves a separate `.ved.json` project.
-Opening the same video again reuses its existing editor buffer.
+The source stays untouched; `C-x C-s` saves a separate `.ved.json` project,
+recording the source path and all edits in source-frame coordinates.
+Opening the same video again reuses its existing editor buffer. You can also
+`C-x C-f` a `.ved.json` project: it loads the source video, restores its edits,
+and continues saving to that project file. Relative source and replacement
+paths resolve relative to the project; missing source files produce an error.
+Reopening an already-open project preserves the live editor's unsaved changes.
+The editor replaces the buffer in the **selected** Emacs window, rather than opening a
+new side window; on X11, the player is split above the editor in that window.
+Other Emacs panes are left alone.
 Ambiguous extensions such as `.ts` (TypeScript), `.mts`, and `.ogg` are not
 intercepted; use `M-x video-edit-open` for transport streams.
 
@@ -50,30 +58,39 @@ renderer or additional install step is needed.
 | Key | Action |
 | --- | --- |
 | `SPC` | Play/pause original footage (when the editing buffer is active) |
-| `←` / `→` | Step one source frame backward/forward |
-| `M-←` / `M-→` | Seek one second |
+| `←` / `→` | Seek backward/forward 5 seconds without unpausing |
+| `↓` / `↑` | Seek backward/forward 60 seconds without unpausing |
+| `M-←` / `M-→` | Seek backward/forward one second |
+| `,` / `.` | Step one source frame backward/forward |
+| `[` / `]` | Decrease/increase playback speed by a factor of 1.1 |
+| `{` / `}` | Halve/double playback speed |
+| `Backspace` | Reset playback speed to 1x |
 | `j` | Jump to source timestamp (`SS`, `MM:SS`, `HH:MM:SS.sss`) |
-| `i` / `o` | Set In/Out markers at MPV playhead |
-| `[` / `]` | Nudge In one frame backward/forward |
-| `{` / `}` | Nudge Out one frame backward/forward |
+| `i` / `o` | Set (or overwrite) In/Out markers at MPV playhead |
+| `k` | Clear both In/Out markers |
 | `d` | Ripple-delete both original video and audio between the markers |
 | `r` | Replace marked video with image/video file, keep original audio |
 | `R` | Replace marked video and audio with another video file |
-| `k` | Remove the edit on the current edit-list line |
+| `C-k` | Remove the edit on the current edit-list line |
 | `RET` | Seek to edit on current line |
 | `u` | Undo edit-list change |
 | `v` | Restore the player pane or restart mpv if it was quit |
 | `p` | Render a temporary 480p preview and play it in MPV |
 | `e` | Render MP4, with source/720/480 resolution choice |
+| `l` | Show FFmpeg diagnostics for the latest export/preview |
 | `C-x C-s` | Save project as `.ved.json` |
 | `q` | Close editor and original MPV window |
+
+The editor displays the current playback speed next to the playback position,
+including speed changes made with mpv shortcuts inside the embedded player.
+The value is polled from mpv; it does not depend on using the Emacs bindings.
 
 Each marker is a **source-frame index**. A selection is **half-open**
 `[IN, OUT)` (OUT is the first frame *after* the selection). Later edits are
 not shifted by earlier deletions. The edit list rejects overlapping edits.
 
-Use `M-x video-edit-open-project` to reopen saved `.ved.json` projects from
-v0.1 (compatible format).
+Saved `.ved.json` projects from v0.1 remain compatible.
+`M-x video-edit-open-project` is also available for opening them explicitly.
 
 ## Rendering rules
 
@@ -97,9 +114,14 @@ v0.1 (compatible format).
   variable-frame-rate source video, and complex stream metadata may require
   additional handling; frame markers assume the reported nominal FPS.
 
-FFmpeg runs asynchronously. The export buffer is `*video-edit-render*`.
-Source MPV logs are in ` *video-edit-mpv-log*`. Customize executables or
-quality with `M-x customize-group RET video-edit`.
+FFmpeg runs asynchronously. Pressing `e` (or `p`) shows an updating progress
+bar and encode time/speed in the Emacs echo area, with the percentage also
+visible in the editor's mode line. It does **not** open a console/log buffer.
+FFmpeg's machine-readable `-progress` stream is parsed by Elisp; FFmpeg
+warnings and errors are retained in `*video-edit-render*`. Press `l` to open
+that log deliberately, especially if an export fails. Source MPV logs are in
+` *video-edit-mpv-log*`. Customize executables or quality with
+`M-x customize-group RET video-edit`.
 
 ## Tests
 

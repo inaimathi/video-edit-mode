@@ -114,20 +114,251 @@
 (ert-deftest video-edit-unit-find-file-reuses-editor ()
   "Opening an already edited video does not start a second mpv process."
   (let ((video (make-temp-file "video-edit-reuse-" nil ".mp4"))
-        (editor (generate-new-buffer " *video-edit-existing-test*"))
+        (editor (generate-new-buffer " *video-edit-existing-test*")))
     (unwind-protect
         (progn
           (with-current-buffer editor
             (video-edit-mode)
             (setq video-edit--source video))
-          (cl-letf (((symbol-function 'pop-to-buffer)
-                     (lambda (_buffer &rest _args) nil))
-                    ((symbol-function 'video-edit--new)
-                     (lambda (&rest _args)
-                       (ert-fail "Unexpected second editor"))))
-            (should (eq editor (video-edit-open video)))))
+          (save-window-excursion
+            (cl-letf (((symbol-function 'video-edit--new)
+                       (lambda (&rest _args)
+                         (ert-fail "Unexpected second editor"))))
+              (should (eq editor (video-edit-open video)))
+              (should (eq editor (window-buffer (selected-window)))))))
       (kill-buffer editor)
       (delete-file video))))
+
+(defun video-edit-test--info ()
+  "Provide fake metadata for editor unit tests without ffprobe."
+  (let ((info (make-hash-table :test #'equal)))
+    (dolist (item '(("path" . "/tmp/example.mp4")
+                    ("fps" . "30/1") ("frame_count" . 300)
+                    ("duration" . 10.0) ("width" . 320)
+                    ("height" . 240) ("has_audio" . t)))
+      (puthash (car item) (cdr item) info))
+    info))
+
+(ert-deftest video-edit-unit-open-uses-selected-window ()
+  "Opening a new video replaces the selected pane, not a side pane."
+  (let ((source (make-temp-file "video-edit-windows-" nil ".mp4"))
+        (other (generate-new-buffer " *video-edit-other-window*"))
+        (editor nil))
+    (unwind-protect
+        (save-window-excursion
+          (delete-other-windows)
+          ;; Exercise both a one-window and a two-window configuration.
+          (dolist (split '(nil t))
+            (delete-other-windows)
+            (switch-to-buffer other)
+            (let* ((target (selected-window))
+                   (extra (when split (split-window-right))))
+              (when extra (set-window-buffer extra other))
+              (cl-letf (((symbol-function 'video-edit--probe)
+                         (lambda (_path) (video-edit-test--info)))
+                        ((symbol-function 'video-edit--start-mpv)
+                         (lambda () nil)))
+                (setq editor (video-edit--new source))
+                (should (eq target (selected-window)))
+                (should (eq editor (window-buffer target)))
+                (should (= (count-windows) (if split 2 1)))
+                (when extra (should (eq other (window-buffer extra)))))
+              (kill-buffer editor)
+              (setq editor nil))))
+      (when (buffer-live-p editor) (kill-buffer editor))
+      (when (buffer-live-p other) (kill-buffer other))
+      (delete-file source))))
+
+(ert-deftest video-edit-unit-save-project-keeps-buffer-local-data ()
+  "Saving a project serializes the editor buffer, not `with-temp-file'."
+  (let* ((source (make-temp-file "video-edit-save-source-" nil ".mp4"))
+         (dest (make-temp-file "video-edit-save-project-" nil ".ved.json"))
+         (editor (generate-new-buffer " *video-edit-save-test*"))
+         (edit '(:start 42 :end 77 :kind "delete" :path nil)))
+    (unwind-protect
+        (with-current-buffer editor
+          (video-edit-mode)
+          (setq video-edit--source source
+                video-edit--edits (list edit))
+          (set-buffer-modified-p t)
+          (video-edit-save-project dest)
+          (should-not (buffer-modified-p))
+          (should (equal video-edit--project-file dest))
+          (let* ((data (with-temp-buffer
+                         (insert-file-contents dest)
+                         (json-parse-buffer :object-type 'hash-table
+                                            :array-type 'list)))
+                 (stored-edit (car (gethash "edits" data))))
+            (should (equal (gethash "source" data) source))
+            (should (= (length (gethash "edits" data)) 1))
+            (should (= (gethash "start" stored-edit) 42))
+            (should (= (gethash "end" stored-edit) 77))
+            (should (equal (gethash "kind" stored-edit) "delete")))
+          (let (reopened)
+            (save-window-excursion
+              ;; Reopening the same project retains any live, unsaved edits.
+              (should (eq editor (video-edit-open-project dest)))
+              (kill-buffer editor)
+              ;; Reopening after closing must deserialize saved edits.
+              (cl-letf (((symbol-function 'video-edit--new)
+                         (lambda (src edits file)
+                           (setq reopened (list src edits file)))))
+                (video-edit-open-project dest)))
+            (should (equal (nth 0 reopened) source))
+            (should (equal (nth 2 reopened) dest))
+            (should (equal (plist-get (car (nth 1 reopened)) :start) 42))))
+      (when (buffer-live-p editor) (kill-buffer editor))
+      (delete-file source)
+      (delete-file dest))))
+
+(ert-deftest video-edit-unit-mpv-like-keybindings ()
+  "Editor shortcuts use mpv-style seeks, speed and frame-step commands."
+  (let (commands)
+    (cl-letf (((symbol-function 'video-edit--ipc-send)
+               (lambda (command &optional _callback) (push command commands))))
+      (dolist (key '("<left>" "<right>" "<down>" "<up>"
+                     "SPC" "[" "]" "{" "}" "DEL" "," "."))
+        (let ((binding (lookup-key video-edit-mode-map (kbd key))))
+          (should (commandp binding))
+          (call-interactively binding)))
+      (should (equal (nreverse commands)
+                     '(("seek" -5 "relative" "exact")
+                       ("seek" 5 "relative" "exact")
+                       ("seek" -60 "relative" "exact")
+                       ("seek" 60 "relative" "exact")
+                       ("cycle" "pause")
+                       ("multiply" "speed" 0.9090909090909091)
+                       ("multiply" "speed" 1.1)
+                       ("multiply" "speed" 0.5)
+                       ("multiply" "speed" 2.0)
+                       ("set_property" "speed" 1.0)
+                       ("frame-back-step")
+                       ("frame-step")))))))
+
+(ert-deftest video-edit-unit-clear-marks-and-remove-edit ()
+  "k clears both markers; C-k deletes only the edit row at point."
+  (with-temp-buffer
+    (video-edit-mode)
+    (setq video-edit--source "/tmp/example.mp4"
+          video-edit--info (video-edit-test--info)
+          video-edit--fps 30.0
+          video-edit--frames 300
+          video-edit--in 10
+          video-edit--out 20
+          video-edit--edits (list '(:start 30 :end 60 :kind "delete" :path nil)))
+    (video-edit--refresh)
+    (should (eq (lookup-key video-edit-mode-map (kbd "k"))
+                'video-edit-clear-marks))
+    (should (eq (lookup-key video-edit-mode-map (kbd "C-k"))
+                'video-edit-remove-edit))
+    (call-interactively (lookup-key video-edit-mode-map (kbd "k")))
+    (should-not video-edit--in)
+    (should-not video-edit--out)
+    (should (= 1 (length video-edit--edits)))
+    (should-error (video-edit--marked-region) :type 'user-error)
+    (goto-char (point-min))
+    (search-forward "  1.")
+    (call-interactively (lookup-key video-edit-mode-map (kbd "C-k")))
+    (should-not video-edit--edits)
+    (should (buffer-modified-p))
+    (video-edit-undo)
+    (should (= 1 (length video-edit--edits)))))
+
+(ert-deftest video-edit-unit-speed-display-tracks-mpv ()
+  "The display reflects external mpv speed changes even when paused."
+  (with-temp-buffer
+    (video-edit-mode)
+    (setq video-edit--source "/tmp/example.mp4"
+          video-edit--info (video-edit-test--info)
+          video-edit--fps 30.0
+          video-edit--frames 300)
+    (let (query-callback)
+      (cl-letf (((symbol-function 'video-edit--ipc-send)
+                 (lambda (command &optional callback)
+                   (should (equal command '("get_property" "speed")))
+                   (setq query-callback callback))))
+        (video-edit--query-speed)
+        (should (functionp query-callback))
+        (funcall query-callback 1.75)
+        (should (= video-edit--speed 1.75))
+        (should (string-match-p "Speed: 1.75x" (buffer-string)))
+        (funcall query-callback 1.0)
+        (should (string-match-p "Speed: 1.00x" (buffer-string)))))))
+
+(ert-deftest video-edit-unit-find-file-project-dispatch ()
+  "find-file routes .ved.json to the project loader, not JSON mode."
+  (let ((project (make-temp-file "video-edit-dispatch-" nil ".ved.json"))
+        (seen nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'video-edit-open-project)
+                   (lambda (file) (setq seen file) :project)))
+          (should (eq :project
+                      (video-edit--find-file-advice
+                       (lambda (&rest _args) :normal) project t)))
+          (should (equal seen project))
+          (let ((video-edit-auto-open nil))
+            (should (eq :normal
+                        (video-edit--find-file-advice
+                         (lambda (&rest _args) :normal) project t)))))
+      (delete-file project))))
+
+(ert-deftest video-edit-unit-project-find-file-restores-edits ()
+  "Opening a project visits its source and restores edits and replacement paths."
+  (let* ((dir (make-temp-file "video-edit-project-" t))
+         (source (expand-file-name "source.mp4" dir))
+         (replacement (expand-file-name "still.png" dir))
+         (project (expand-file-name "session.ved.json" dir))
+         (editor nil))
+    (unwind-protect
+        (save-window-excursion
+          (with-temp-file source (insert ""))
+          (with-temp-file replacement (insert ""))
+          (with-temp-file project
+            (insert (json-encode
+                     '((version . 1) (source . "source.mp4")
+                       (edits . [((start . 30) (end . 60) (kind . "delete"))
+                                 ((start . 120) (end . 180)
+                                  (kind . "replace-keep") (path . "still.png"))])))))
+          (cl-letf (((symbol-function 'video-edit--probe)
+                     (lambda (_file) (video-edit-test--info)))
+                    ((symbol-function 'video-edit--start-mpv)
+                     (lambda () nil)))
+            (setq editor (video-edit--find-file-advice
+                          (lambda (&rest _args) (ert-fail "Unexpected JSON buffer"))
+                          project t)))
+          (should (eq editor (window-buffer (selected-window))))
+          (with-current-buffer editor
+            (should (eq major-mode 'video-edit-mode))
+            (should (equal video-edit--source source))
+            (should (equal video-edit--project-file project))
+            (should (= (length video-edit--edits) 2))
+            (should (equal (plist-get (cadr video-edit--edits) :path)
+                           replacement))
+            (should (string-match-p "replace-keep" (buffer-string)))
+            (set-buffer-modified-p t))
+          (should (eq editor (video-edit-open-project project)))
+          (with-current-buffer editor
+            (should (buffer-modified-p))))
+      (when (buffer-live-p editor)
+        (with-current-buffer editor (set-buffer-modified-p nil))
+        (kill-buffer editor))
+      (delete-directory dir t))))
+
+(ert-deftest video-edit-unit-project-missing-source-error ()
+  "A project pointing to a missing source fails with a useful error."
+  (let* ((dir (make-temp-file "video-edit-missing-source-" t))
+         (project (expand-file-name "broken.ved.json" dir)))
+    (unwind-protect
+        (progn
+          (with-temp-file project
+            (insert "{\"version\":1,\"source\":\"missing.mp4\",\"edits\":[]}"))
+          (should-error (video-edit-open-project project) :type 'user-error)
+          (condition-case err
+              (video-edit-open-project project)
+            (user-error
+             (should (string-match-p "source video is missing"
+                                     (error-message-string err))))))
+      (delete-directory dir t))))
 
 (ert-deftest video-edit-unit-mpv-embedding-args ()
   "Embedded players get their host XID and mpv's native keyboard bindings."
@@ -160,6 +391,55 @@
             (should (= (gethash "width" info) 160))
             (should (= (gethash "height" info) 120))))
       (delete-file source))))
+
+(ert-deftest video-edit-unit-render-progress-format ()
+  "Parse FFmpeg progress clocks and display bounded percentages."
+  (should (= (video-edit--progress-seconds "01:08:33.684000") 4113.684))
+  (should (= (video-edit--progress-seconds "00:00:04.18") 4.18))
+  (should-not (video-edit--progress-seconds "N/A"))
+  (should-not (video-edit--progress-seconds "-00:00:00.02"))
+  (should (equal (video-edit--progress-clock 4113.684) "01:08:33"))
+  (should (string-match-p "50%" (video-edit--progress-description 5 10 "2.0x")))
+  (should (string-match-p "100%" (video-edit--progress-description 20 10 nil)))
+  (should (string-match-p "  0%" (video-edit--progress-description -5 10 nil))))
+
+(ert-deftest video-edit-unit-render-progress-chunking ()
+  "A split -progress record must yield exactly one update per completed block."
+  (let ((props (make-hash-table :test #'eq))
+        (updates nil))
+    (cl-letf (((symbol-function 'process-get)
+               (lambda (_proc key) (gethash key props)))
+              ((symbol-function 'process-put)
+               (lambda (_proc key value) (puthash key value props)))
+              ((symbol-function 'video-edit--render-progress-update)
+               (lambda (_editor duration elapsed speed label)
+                 (push (list duration elapsed speed label) updates))))
+      (video-edit--render-progress-filter 'fake "out_time=00:00:04." nil 10 "Export")
+      (should-not updates)
+      (video-edit--render-progress-filter
+       'fake "180000\nspeed=6.7x\nprogress=cont" nil 10 "Export")
+      (should-not updates)
+      (video-edit--render-progress-filter
+       'fake "inue\nout_time=00:00:09.00\nspeed=2.0x\nprogress=end\n"
+       nil 10 "Export")
+      (should (equal (reverse updates)
+                     '((10 4.18 "6.7x" "Export")
+                       (10 10 "2.0x" "Export"))))
+      (should (equal (process-get 'fake 'video-edit-pending) "")))))
+
+(ert-deftest video-edit-unit-render-command-uses-machine-progress ()
+  "Rendering uses FFmpeg's progress channel rather than tty status lines."
+  (cl-letf (((symbol-function 'video-edit--executable) #'identity))
+    (let* ((command (video-edit--render-command
+                     '(:args ("-i" "source.mp4") :preset "medium"
+                       :crf 20 :duration 10.0)
+                     "/tmp/filter" "result.mp4"))
+           (progress (member "-progress" command)))
+      (should (equal (car command) "ffmpeg"))
+      (should (equal (cadr progress) "pipe:1"))
+      (should (member "-nostats" command))
+      (should (member "-nostdin" command))
+      (should (equal (car (last command)) "result.mp4")))))
 
 (ert-deftest video-edit-unit-rate-and-timeline ()
   (should (= 29.97002997002997 (video-edit--rational-value "30000/1001")))
