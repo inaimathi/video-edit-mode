@@ -79,6 +79,88 @@
                 imag (+ imag (* sample (sin angle))))))
       (if (zerop n) 0.0 (/ (sqrt (+ (* real real) (* imag imag))) n)))))
 
+(ert-deftest video-edit-unit-find-file-dispatch ()
+  "Visiting a local video invokes the editor before Emacs reads its bytes."
+  (let ((video (make-temp-file "video-edit-autoload-" nil ".MKV"))
+        (text (make-temp-file "video-edit-autoload-" nil ".ts"))
+        (seen nil)
+        (fallback nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'video-edit-open)
+                   (lambda (source) (setq seen source) :editor)))
+          (should (eq :editor
+                      (video-edit--find-file-advice
+                       (lambda (&rest args) (setq fallback args) :normal)
+                       video t)))
+          (should (equal seen video))
+          (should-not fallback)
+          ;; TypeScript .ts, wildcard patterns, and disabled auto-open
+          ;; retain Emacs's usual find-file behavior.
+          (should (eq :normal
+                      (video-edit--find-file-advice
+                       (lambda (&rest args) (setq fallback args) :normal)
+                       text)))
+          (should (equal fallback (list text nil)))
+          (should (eq :normal
+                      (video-edit--find-file-advice
+                       (lambda (&rest _args) :normal) "*.MKV" t)))
+          (let ((video-edit-auto-open nil))
+            (should (eq :normal
+                        (video-edit--find-file-advice
+                         (lambda (&rest _args) :normal) video)))))
+      (delete-file video)
+      (delete-file text))))
+
+(ert-deftest video-edit-unit-find-file-reuses-editor ()
+  "Opening an already edited video does not start a second mpv process."
+  (let ((video (make-temp-file "video-edit-reuse-" nil ".mp4"))
+        (editor (generate-new-buffer " *video-edit-existing-test*"))
+    (unwind-protect
+        (progn
+          (with-current-buffer editor
+            (video-edit-mode)
+            (setq video-edit--source video))
+          (cl-letf (((symbol-function 'pop-to-buffer)
+                     (lambda (_buffer &rest _args) nil))
+                    ((symbol-function 'video-edit--new)
+                     (lambda (&rest _args)
+                       (ert-fail "Unexpected second editor"))))
+            (should (eq editor (video-edit-open video)))))
+      (kill-buffer editor)
+      (delete-file video))))
+
+(ert-deftest video-edit-unit-mpv-embedding-args ()
+  "Embedded players get their host XID and mpv's native keyboard bindings."
+  (let ((embedded (video-edit--mpv-args "/tmp/input.mp4" "/tmp/mpv.sock" "9876"))
+        (external (video-edit--mpv-args "/tmp/input.mp4" "/tmp/mpv.sock")))
+    (should (member "--wid=9876" embedded))
+    (should (member "--input-vo-keyboard=yes" embedded))
+    (should (member "--input-default-bindings=yes" embedded))
+    (should (member "--input-ipc-server=/tmp/mpv.sock" embedded))
+    (should (equal (car (last embedded)) "/tmp/input.mp4"))
+    (should-not (cl-some (lambda (arg) (string-prefix-p "--wid=" arg)) external))
+    (should-not (member "--input-vo-keyboard=yes" external))))
+
+(ert-deftest video-edit-unit-probe-fps-binding ()
+  "Keep ffprobe metadata validation inside the FPS lexical scope."
+  (let ((source (make-temp-file "video-edit-probe-" nil ".mp4"))
+        (metadata (json-parse-string
+                   (concat "{\"streams\":[{\"codec_type\":\"video\","
+                           "\"r_frame_rate\":\"30000/1001\","
+                           "\"avg_frame_rate\":\"30000/1001\","
+                           "\"width\":160,\"height\":120}],"
+                           "\"format\":{\"duration\":\"2.0\"}}")
+                   :object-type 'hash-table :array-type 'list)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'video-edit--run-json)
+                   (lambda (_program _args) metadata)))
+          (let ((info (video-edit--probe source)))
+            (should (equal (gethash "fps" info) "30000/1001"))
+            (should (= (gethash "frame_count" info) 60))
+            (should (= (gethash "width" info) 160))
+            (should (= (gethash "height" info) 120))))
+      (delete-file source))))
+
 (ert-deftest video-edit-unit-rate-and-timeline ()
   (should (= 29.97002997002997 (video-edit--rational-value "30000/1001")))
   (should (equal "00:00:01.000"
